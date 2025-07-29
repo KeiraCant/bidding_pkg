@@ -20,7 +20,7 @@ class AllocatorNode(Node):
 
         self.assignment_pub = self.create_publisher(String, '/assignments', assignment_qos)
         self.create_subscription(String, '/bids', self.bid_callback, 10)
-        self.create_subscription(String, '/task_done', self.task_done_callback, 10)
+        self.create_subscription(String, '/task_done', self.task_done_callback, assignment_qos)
 
         self.get_logger().info("Allocator node with task queue ready.")
 

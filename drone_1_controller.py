@@ -5,7 +5,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 import json
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from mavros_msgs.srv import CommandBool, SetMode
+from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
 from rclpy.clock import Clock
 import math
 import time
@@ -84,9 +84,14 @@ class Drone1Controller(Node):
         self.collision_wait_start = None
         self.last_retry_time = 0
         self.task_simulation_start = None
-        
-        self.arm_drone()
         self.set_guided_mode()
+        while self.flight_mode != "GUIDED":
+            rclpy.sleep(0.1)
+        self.arm_drone()
+        while not self.armed:
+            rclpy.sleep(0.1)
+        self.set_takeoff()
+        
         if self.current_position and self.is_path_safe(self.assignment['location']):
             self.publish_path(self.current_position, self.assignment['location'])
         else:
@@ -181,7 +186,7 @@ class Drone1Controller(Node):
             (goal[1] - self.current_position.y)**2 +
             (goal[2] - self.current_position.z)**2
         )
-        
+        print
         if dist_to_goal < 1.0:
             if self.task_simulation_start is None:
                 self.get_logger().info(f"🎯 Reached task {self.assignment['task_id']}. Starting task simulation...")
@@ -224,6 +229,33 @@ class Drone1Controller(Node):
             f"to [{goal_location[0]:.2f}, {goal_location[1]:.2f}, {goal_location[2]:.2f}]"
         )
 
+    def set_guided_mode(self):
+        client = self.create_client(SetMode, f'/{self.drone_id}/mavros/set_mode')
+        retries = 5
+        while not client.wait_for_service(timeout_sec=1.0) and retries > 0:
+            self.get_logger().warn(f"🕓 Waiting for /{self.drone_id}/mavros/set_mode service... ({retries} retries left)")
+            retries -= 1
+            time.sleep(1)
+        if retries == 0:
+            self.get_logger().error("❌ Set mode service unavailable")
+            return
+
+        request = SetMode.Request()
+        request.custom_mode = "GUIDED"
+        future = client.call_async(request)
+
+        def response_callback(future):
+            try:
+                result = future.result()
+                if result.mode_sent:
+                    self.get_logger().info("🧭 Flight mode set to GUIDED.")
+                else:
+                    self.get_logger().warn("⚠️ Failed to set GUIDED mode. FCU may be rejecting it.")
+            except Exception as e:
+                self.get_logger().error(f"Error during mode change: {e}")
+
+        future.add_done_callback(response_callback)
+        
     def arm_drone(self):
         client = self.create_client(CommandBool, f'/{self.drone_id}/mavros/cmd/arming')
         retries = 5
@@ -234,13 +266,14 @@ class Drone1Controller(Node):
         if retries == 0:
             self.get_logger().error("❌ Arming service unavailable")
             return
+
         request = CommandBool.Request()
         request.value = True
         future = client.call_async(request)
+
         def response_callback(future):
             try:
                 result = future.result()
-                self.get_logger().debug(f"Arming response: success={result.success}, result={result.result}")
                 if result.success:
                     self.get_logger().info("✅ Drone armed successfully.")
                     self.armed = True
@@ -248,22 +281,37 @@ class Drone1Controller(Node):
                     self.get_logger().warn("❌ Drone failed to arm. Check flight mode and safety settings.")
             except Exception as e:
                 self.get_logger().error(f"Error during arming: {e}")
+
         future.add_done_callback(response_callback)
 
-    def set_guided_mode(self):
-        client = self.create_client(SetMode, f'/{self.drone_id}/mavros/set_mode')
+    def set_takeoff(self):
+        client = self.create_client(CommandTOL, f'/{self.drone_id}/mavros/cmd/takeoff')
         retries = 5
         while not client.wait_for_service(timeout_sec=1.0) and retries > 0:
-            self.get_logger().warn(f'🕓 Waiting for /{self.drone_id}/mavros/set_mode service... ({retries} retries left)')
+            self.get_logger().warn(f'🕓 Waiting for /{self.drone_id}/mavros/cmd/takeoff service... ({retries} retries left)')
             retries -= 1
             time.sleep(1)
         if retries == 0:
-            self.get_logger().error("❌ Set mode service unavailable")
+            self.get_logger().error("❌ Takeoff service unavailable")
             return
-        request = SetMode.Request()
-        request.custom_mode = "GUIDED"
+
+        request = CommandTOL.Request()
+        request.altitude = 10.0
+
         future = client.call_async(request)
-        self.get_logger().info("🧭 Setting flight mode to GUIDED...")
+
+        def response_callback(future):
+            try:
+                result = future.result()
+                if result.success:
+                    self.get_logger().info("🚀 Takeoff initiated successfully.")
+                else:
+                    self.get_logger().warn(f"❌ Takeoff request rejected by FCU. Result={result.result}")
+            except Exception as e:
+                self.get_logger().error(f"Error during takeoff: {e}")
+
+        future.add_done_callback(response_callback)
+    
 
 def main(args=None):
     rclpy.init(args=args)
