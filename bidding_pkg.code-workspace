@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../../../ardupilot_gazebo/models/iris_with_lidar"
+		}
+	],
+	"settings": {}
+}
