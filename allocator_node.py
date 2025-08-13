@@ -9,8 +9,7 @@ class AllocatorNode(Node):
     def __init__(self):
         super().__init__('allocator_node')
 
-        self.active_tasks = {}  # task_id -> list of (drone_id, bid_score, priority, location)
-        self.task_priority = {}  # task_id -> priority
+        self.active_tasks = {}  # task_id -> list of (drone_id, bid_score, location)
         self.task_timers = {}  # task_id -> timer start time
         self.pending_tasks = []  # queue of task_ids
         self.busy_drones = set()  # set of drone_ids
@@ -45,23 +44,20 @@ class AllocatorNode(Node):
             task_id = bid['task_id']
             drone_id = bid['drone_id']
             bid_score = bid['bid_score']
-            priority = bid.get('priority', 1)
             location = bid['location']
 
             if task_id not in self.active_tasks:
                 self.active_tasks[task_id] = []
-                self.task_priority[task_id] = priority
-                self.task_timers[task_id] = time.time()  # Start timer for this task
+                self.task_timers[task_id] = time.time()
                 self.get_logger().info(f"⏰ Started 10-second bid timer for task {task_id}")
 
-            self.active_tasks[task_id].append((drone_id, bid_score, priority, location))
+            self.active_tasks[task_id].append((drone_id, bid_score, location))
 
             self.get_logger().info(
                 f"\n📨 New bid received:\n"
                 f"  🔧 Task ID: {task_id}\n"
                 f"  🚁 Drone ID: {drone_id}\n"
                 f"  📊 Score: {bid_score:.2f}\n"
-                f"  ⬆️ Priority: {priority}\n"
                 f"  📍 Location: {location}\n"
                 f"  📊 Total bids for this task: {len(self.active_tasks[task_id])}"
             )
@@ -75,7 +71,6 @@ class AllocatorNode(Node):
             self.get_logger().error(f"❌ Error in bid_callback: {e}")
 
     def check_expired_tasks(self):
-        """Check for tasks whose bid timer has expired"""
         current_time = time.time()
         expired_tasks = []
         
@@ -93,11 +88,8 @@ class AllocatorNode(Node):
                     del self.task_timers[task_id]
                 if task_id in self.active_tasks:
                     del self.active_tasks[task_id]
-                if task_id in self.task_priority:
-                    del self.task_priority[task_id]
 
     def try_assign_task(self, task_id):
-        """Try to assign a task to an available drone"""
         if task_id not in self.active_tasks:
             return
 
@@ -120,9 +112,9 @@ class AllocatorNode(Node):
             self.get_logger().warn(f"Task {task_id} already assigned or not active.")
             return
 
-        best = min(eligible_bids, key=lambda x: x[1])
+        best = min(eligible_bids, key=lambda x: x[1])  # lowest bid_score wins
         drone_id = best[0]
-        location = best[3]
+        location = best[2]
 
         assignment = {
             'task_id': task_id,
@@ -139,8 +131,6 @@ class AllocatorNode(Node):
         del self.active_tasks[task_id]
         if task_id in self.task_timers:
             del self.task_timers[task_id]
-        if task_id in self.task_priority:
-            del self.task_priority[task_id]
         if task_id in self.pending_tasks:
             self.pending_tasks.remove(task_id)
 
@@ -182,3 +172,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+

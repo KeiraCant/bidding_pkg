@@ -1,656 +1,363 @@
-
+import math
+import json
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import PoseStamped
-import math
-import random
-import numpy as np
-from typing import Dict, Tuple, List
-import heapq
-from abc import ABC, abstractmethod
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
+from nav_msgs.msg import Path
 
-class PathPlanner(ABC):
-    """Base class for all path planners"""
-    def __init__(self, drone_id: str, logger):
-        self.drone_id = drone_id
-        self.logger = logger
-        self.safety_distance = 3.0
-        self.obstacles = set()  # Set of obstacle grid coordinates
-        
-    @abstractmethod
-    def plan(self, start, goal) -> List[Tuple[float, float, float]]:
-        pass
-    
-    def is_safe(self, start, goal, drone_poses: dict) -> bool:
-        """Check if direct path is safe from other drones"""
-        for drone_id, pose_msg in drone_poses.items():
-            if drone_id == self.drone_id:
-                continue
-                
-            drone_pos = pose_msg.pose.position
-            if self._point_to_line_distance(
-                (start.x, start.y, start.z),
-                (goal[0], goal[1], goal[2]),
-                (drone_pos.x, drone_pos.y, drone_pos.z)
-            ) < self.safety_distance:
-                return False
-        return True
-    
-    def _point_to_line_distance(self, line_start, line_end, point):
-        """Calculate minimum distance from point to line segment"""
-        line_vec = np.array(line_end) - np.array(line_start)
-        point_vec = np.array(point) - np.array(line_start)
-        line_len = np.linalg.norm(line_vec)
-        
-        if line_len < 1e-6:
-            return np.linalg.norm(point_vec)
-        
-        line_unitvec = line_vec / line_len
-        proj_length = np.dot(point_vec, line_unitvec)
-        proj_length = max(min(proj_length, line_len), 0)
-        proj = line_unitvec * proj_length
-        return np.linalg.norm(point_vec - proj)
 
-class AStarPlanner(PathPlanner):
-    """A* path planner with 3D grid-based search"""
-    
-    def __init__(self, drone_id: str, logger, grid_size: float = 2.0, search_radius: float = 50.0):
-        super().__init__(drone_id, logger)
-        self.grid_size = grid_size
-        self.search_radius = search_radius
-        
-    def plan(self, start, goal) -> List[Tuple[float, float, float]]:
-        """Plan path using A* algorithm"""
-        start_pos = (start.x, start.y, start.z)
-        goal_pos = tuple(goal)
-        
-        # Convert to grid coordinates
-        start_grid = self._world_to_grid(start_pos)
-        goal_grid = self._world_to_grid(goal_pos)
-        
-        # A* algorithm
-        open_set = []
-        heapq.heappush(open_set, (0, start_grid))
-        came_from = {}
-        g_score = {start_grid: 0}
-        f_score = {start_grid: self._heuristic(start_grid, goal_grid)}
-        
-        directions = [
-            (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0),
-            (0, 0, 1), (0, 0, -1),  # 6-connected
-            (1, 1, 0), (1, -1, 0), (-1, 1, 0), (-1, -1, 0),  # 8-connected in XY
-            (1, 0, 1), (-1, 0, 1), (1, 0, -1), (-1, 0, -1),  # Diagonal in XZ
-            (0, 1, 1), (0, -1, 1), (0, 1, -1), (0, -1, -1),  # Diagonal in YZ
-            (1, 1, 1), (1, 1, -1), (1, -1, 1), (-1, 1, 1),   # 3D diagonals
-            (-1, -1, 1), (-1, 1, -1), (1, -1, -1), (-1, -1, -1)
-        ]
-        
-        while open_set:
-            current = heapq.heappop(open_set)[1]
-            
-            if current == goal_grid:
-                # Reconstruct path
-                path = []
-                while current in came_from:
-                    world_pos = self._grid_to_world(current)
-                    path.append(world_pos)
-                    current = came_from[current]
-                path.append(start_pos)
-                path.reverse()
-                
-                # Smooth path
-                return self._smooth_path(path)
-            
-            for dx, dy, dz in directions:
-                neighbor = (current[0] + dx, current[1] + dy, current[2] + dz)
-                
-                if self._is_obstacle(neighbor):
-                    continue
-                
-                # Cost is Euclidean distance
-                movement_cost = math.sqrt(dx*dx + dy*dy + dz*dz) * self.grid_size
-                tentative_g_score = g_score[current] + movement_cost
-                
-                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g_score
-                    f_score[neighbor] = tentative_g_score + self._heuristic(neighbor, goal_grid)
-                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
-        
-        # No path found, return direct path
-        self.logger.warning(f"[drone_{self.drone_id}] A* couldn't find path, using direct route")
-        return [start_pos, goal_pos]
-    
-    def _world_to_grid(self, pos: Tuple[float, float, float]) -> Tuple[int, int, int]:
-        """Convert world coordinates to grid coordinates"""
-        return (
-            int(pos[0] / self.grid_size),
-            int(pos[1] / self.grid_size),
-            int(pos[2] / self.grid_size)
-        )
-    
-    def _grid_to_world(self, grid_pos: Tuple[int, int, int]) -> Tuple[float, float, float]:
-        """Convert grid coordinates to world coordinates"""
-        return (
-            grid_pos[0] * self.grid_size,
-            grid_pos[1] * self.grid_size,
-            grid_pos[2] * self.grid_size
-        )
-    
-    def _heuristic(self, pos1: Tuple[int, int, int], pos2: Tuple[int, int, int]) -> float:
-        """Euclidean distance heuristic"""
-        dx = pos1[0] - pos2[0]
-        dy = pos1[1] - pos2[1]
-        dz = pos1[2] - pos2[2]
-        return math.sqrt(dx*dx + dy*dy + dz*dz) * self.grid_size
-    
-    def _is_obstacle(self, grid_pos: Tuple[int, int, int]) -> bool:
-        """Check if grid position contains an obstacle"""
-        return grid_pos in self.obstacles
-    
-    def _smooth_path(self, path: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
-        """Smooth the path by removing unnecessary waypoints"""
-        if len(path) <= 2:
-            return path
-        
-        smoothed = [path[0]]
-        i = 0
-        
-        while i < len(path) - 1:
-            j = len(path) - 1
-            while j > i + 1:
-                if self._is_line_clear(path[i], path[j]):
-                    smoothed.append(path[j])
-                    i = j
-                    break
-                j -= 1
-            else:
-                smoothed.append(path[i + 1])
-                i += 1
-        
-        return smoothed
-    
-    def _is_line_clear(self, start: Tuple[float, float, float], end: Tuple[float, float, float]) -> bool:
-        """Check if line segment is clear of obstacles"""
-        steps = int(math.sqrt(sum((e-s)**2 for s, e in zip(start, end))) / self.grid_size) + 1
-        for i in range(steps + 1):
-            t = i / max(steps, 1)
-            point = tuple(s + t * (e - s) for s, e in zip(start, end))
-            grid_point = self._world_to_grid(point)
-            if self._is_obstacle(grid_point):
-                return False
-        return True
+# Constants for your known base reference coordinates
+BASE_LAT = 63.4188137258128
+BASE_LON = 10.401553034756608
 
-class RRTStarPlanner(PathPlanner):
-    """RRT* (Rapidly-exploring Random Tree Star) path planner"""
+def latlon_to_xy(lat, lon):
+    """Convert lat/lon to local XY in meters relative to base."""
+    R = 6378137  # Earth radius in meters
+    dx = (lon - BASE_LON) * (math.pi / 180) * R * math.cos(math.radians(BASE_LAT))
+    dy = (lat - BASE_LAT) * (math.pi / 180) * R
+    return dx, dy
+
+
+class MultiWaypointPlanner:
+    """Simple path planner that visits all waypoints in priority order."""
     
-    def __init__(self, drone_id: str, logger, max_iter: int = 1000, step_size: float = 3.0, 
-                 search_radius: float = 50.0, rewire_radius: float = 5.0):
-        super().__init__(drone_id, logger)
-        self.max_iter = max_iter
-        self.step_size = step_size
-        self.search_radius = search_radius
-        self.rewire_radius = rewire_radius
-        
-    def plan(self, start, goal) -> List[Tuple[float, float, float]]:
-        """Plan path using RRT* algorithm"""
-        start_pos = (start.x, start.y, start.z)
-        goal_pos = tuple(goal)
-        
-        # Initialize tree
-        nodes = {0: {'pos': start_pos, 'parent': None, 'cost': 0.0}}
-        node_id = 1
-        goal_node_id = None
-        
-        for iteration in range(self.max_iter):
-            # Sample random point (with goal bias)
-            if random.random() < 0.1:  # 10% goal bias
-                sample_pos = goal_pos
-            else:
-                sample_pos = self._sample_random_point(start_pos, goal_pos)
+    def __init__(self, detour_threshold=20.0, nearby_radius=30.0):
+        self.detour_threshold = detour_threshold
+        self.nearby_radius = nearby_radius
+
+    def distance(self, p1, p2):
+        """Calculate Euclidean distance between two points."""
+        return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+    def plan_multi_waypoint_path(self, start_pos, priority_tasks, logger=None):
+        """Plan a path visiting all waypoints in priority order with smart detours."""
+        if not priority_tasks:
+            return []
             
-            # Find nearest node
-            nearest_id = self._find_nearest_node(nodes, sample_pos)
-            nearest_pos = nodes[nearest_id]['pos']
-            
-            # Steer towards sample
-            new_pos = self._steer(nearest_pos, sample_pos)
-            
-            # Check if path is collision-free
-            if not self._is_path_clear(nearest_pos, new_pos):
-                continue
-            
-            # Find nodes within rewire radius
-            near_nodes = self._find_near_nodes(nodes, new_pos)
-            
-            # Choose parent (minimize cost)
-            best_parent_id = nearest_id
-            min_cost = nodes[nearest_id]['cost'] + self._distance(nearest_pos, new_pos)
-            
-            for near_id in near_nodes:
-                near_pos = nodes[near_id]['pos']
-                if self._is_path_clear(near_pos, new_pos):
-                    cost = nodes[near_id]['cost'] + self._distance(near_pos, new_pos)
-                    if cost < min_cost:
-                        best_parent_id = near_id
-                        min_cost = cost
-            
-            # Add new node
-            nodes[node_id] = {
-                'pos': new_pos,
-                'parent': best_parent_id,
-                'cost': min_cost
-            }
-            
-            # Rewire tree
-            for near_id in near_nodes:
-                if near_id == best_parent_id:
-                    continue
-                near_pos = nodes[near_id]['pos']
-                new_cost = min_cost + self._distance(new_pos, near_pos)
-                if new_cost < nodes[near_id]['cost'] and self._is_path_clear(new_pos, near_pos):
-                    nodes[near_id]['parent'] = node_id
-                    nodes[near_id]['cost'] = new_cost
-                    self._update_children_cost(nodes, near_id)
-            
-            # Check if we reached the goal
-            if self._distance(new_pos, goal_pos) < self.step_size:
-                if self._is_path_clear(new_pos, goal_pos):
-                    goal_cost = min_cost + self._distance(new_pos, goal_pos)
-                    if goal_node_id is None or goal_cost < nodes[goal_node_id]['cost']:
-                        goal_node_id = node_id + 1
-                        nodes[goal_node_id] = {
-                            'pos': goal_pos,
-                            'parent': node_id,
-                            'cost': goal_cost
-                        }
-            
-            node_id += 1
-        
-        # Extract path
-        if goal_node_id is not None:
-            path = []
-            current_id = goal_node_id
-            while current_id is not None:
-                path.append(nodes[current_id]['pos'])
-                current_id = nodes[current_id]['parent']
-            path.reverse()
-            self.logger.info(f"[drone_{self.drone_id}] RRT* found path with {len(path)} waypoints, cost: {nodes[goal_node_id]['cost']:.2f}")
-            return path
-        else:
-            self.logger.warning(f"[drone_{self.drone_id}] RRT* couldn't find path, using direct route")
-            return [start_pos, goal_pos]
-    
-    def _sample_random_point(self, start_pos: Tuple[float, float, float], 
-                           goal_pos: Tuple[float, float, float]) -> Tuple[float, float, float]:
-        """Sample a random point within search area"""
-        center_x = (start_pos[0] + goal_pos[0]) / 2
-        center_y = (start_pos[1] + goal_pos[1]) / 2
-        center_z = (start_pos[2] + goal_pos[2]) / 2
-        
-        return (
-            center_x + random.uniform(-self.search_radius, self.search_radius),
-            center_y + random.uniform(-self.search_radius, self.search_radius),
-            center_z + random.uniform(-5, 15)  # Keep reasonable altitude
-        )
-    
-    def _find_nearest_node(self, nodes: Dict, pos: Tuple[float, float, float]) -> int:
-        """Find the nearest node to given position"""
-        min_dist = float('inf')
-        nearest_id = 0
-        
-        for node_id, node in nodes.items():
-            dist = self._distance(node['pos'], pos)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_id = node_id
-        
-        return nearest_id
-    
-    def _find_near_nodes(self, nodes: Dict, pos: Tuple[float, float, float]) -> List[int]:
-        """Find nodes within rewire radius"""
-        near_nodes = []
-        for node_id, node in nodes.items():
-            if self._distance(node['pos'], pos) <= self.rewire_radius:
-                near_nodes.append(node_id)
-        return near_nodes
-    
-    def _steer(self, from_pos: Tuple[float, float, float], 
-              to_pos: Tuple[float, float, float]) -> Tuple[float, float, float]:
-        """Steer from one position towards another with step size limit"""
-        dist = self._distance(from_pos, to_pos)
-        if dist <= self.step_size:
-            return to_pos
-        
-        ratio = self.step_size / dist
-        return (
-            from_pos[0] + ratio * (to_pos[0] - from_pos[0]),
-            from_pos[1] + ratio * (to_pos[1] - from_pos[1]),
-            from_pos[2] + ratio * (to_pos[2] - from_pos[2])
-        )
-    
-    def _distance(self, pos1: Tuple[float, float, float], pos2: Tuple[float, float, float]) -> float:
-        """Calculate Euclidean distance between two positions"""
-        return math.sqrt(sum((p1 - p2)**2 for p1, p2 in zip(pos1, pos2)))
-    
-    def _is_path_clear(self, start_pos: Tuple[float, float, float], 
-                      end_pos: Tuple[float, float, float]) -> bool:
-        """Check if path between two points is clear"""
-        steps = int(self._distance(start_pos, end_pos) / 0.5) + 1
-        for i in range(steps + 1):
-            t = i / max(steps, 1)
-            point = tuple(s + t * (e - s) for s, e in zip(start_pos, end_pos))
-            grid_point = (
-                int(point[0] / 2.0),
-                int(point[1] / 2.0),
-                int(point[2] / 2.0)
+        if logger:
+            logger.info(f"Planning multi-waypoint path for {len(priority_tasks)} tasks")
+
+        # Extract coordinates and sort by priority (highest urban % first)
+        unvisited = [(coords, priority, task_id) for priority, task_id, coords in priority_tasks]
+        path = [start_pos[:2]]  # Start with current position (x,y only)
+        current_pos = start_pos[:2]
+        total_distance = 0.0
+
+        while unvisited:
+            # Find next waypoint with detours
+            next_idx, detour_indices = self._find_next_waypoint_with_detours(
+                current_pos, unvisited, logger
             )
-            if grid_point in self.obstacles:
-                return False
-        return True
-    
-    def _update_children_cost(self, nodes: Dict, parent_id: int):
-        """Recursively update cost of children nodes"""
-        for node_id, node in nodes.items():
-            if node['parent'] == parent_id:
-                old_cost = node['cost']
-                new_cost = nodes[parent_id]['cost'] + self._distance(nodes[parent_id]['pos'], node['pos'])
-                node['cost'] = new_cost
-                if new_cost != old_cost:  # Only recurse if cost changed
-                    self._update_children_cost(nodes, node_id)
-
-class DijkstraPlanner(PathPlanner):
-    """Dijkstra's algorithm path planner with 3D grid"""
-    
-    def __init__(self, drone_id: str, logger, grid_size: float = 2.0, search_radius: float = 50.0):
-        super().__init__(drone_id, logger)
-        self.grid_size = grid_size
-        self.search_radius = search_radius
-        
-    def plan(self, start, goal) -> List[Tuple[float, float, float]]:
-        """Plan path using Dijkstra's algorithm"""
-        start_pos = (start.x, start.y, start.z)
-        goal_pos = tuple(goal)
-        
-        # Convert to grid coordinates
-        start_grid = self._world_to_grid(start_pos)
-        goal_grid = self._world_to_grid(goal_pos)
-        
-        # Dijkstra's algorithm
-        distances = {start_grid: 0}
-        previous = {}
-        unvisited = set()
-        
-        # Priority queue: (distance, node)
-        pq = [(0, start_grid)]
-        
-        # 26-connected neighborhood (3D)
-        directions = [
-            (dx, dy, dz) 
-            for dx in [-1, 0, 1] 
-            for dy in [-1, 0, 1] 
-            for dz in [-1, 0, 1] 
-            if not (dx == 0 and dy == 0 and dz == 0)
-        ]
-        
-        while pq:
-            current_dist, current = heapq.heappop(pq)
             
-            if current == goal_grid:
-                # Reconstruct path
-                path = []
-                while current in previous:
-                    world_pos = self._grid_to_world(current)
-                    path.append(world_pos)
-                    current = previous[current]
-                path.append(start_pos)
-                path.reverse()
+            # Add detour points first (in reverse order to maintain indices)
+            for detour_idx in sorted(detour_indices, reverse=True):
+                detour_coords, detour_priority, detour_task_id = unvisited.pop(detour_idx)
+                path.append(detour_coords[:2])
                 
-                self.logger.info(f"[drone_{self.drone_id}] Dijkstra found path with {len(path)} waypoints, cost: {current_dist:.2f}")
-                return self._smooth_path(path)
-            
-            if current_dist > distances.get(current, float('inf')):
+                distance_to_detour = self.distance(current_pos, detour_coords[:2])
+                total_distance += distance_to_detour
+                current_pos = detour_coords[:2]
+                
+                if logger:
+                    logger.debug(f"Detour to {detour_task_id} (priority={-detour_priority:.1f}%), distance={distance_to_detour:.1f}m")
+
+            # Adjust next_idx after removing detour points
+            for detour_idx in sorted(detour_indices):
+                if detour_idx <= next_idx:
+                    next_idx -= 1
+
+            # Add main next waypoint
+            if next_idx < len(unvisited):
+                next_coords, next_priority, next_task_id = unvisited.pop(next_idx)
+                path.append(next_coords[:2])
+                
+                distance_to_next = self.distance(current_pos, next_coords[:2])
+                total_distance += distance_to_next
+                current_pos = next_coords[:2]
+                
+                if logger:
+                    logger.debug(f"Main waypoint: {next_task_id} (priority={-next_priority:.1f}%), distance={distance_to_next:.1f}m")
+
+        if logger:
+            logger.info(f"Multi-waypoint path complete: {len(path)} waypoints, total distance: {total_distance:.1f}m")
+
+        return path
+
+    def _find_next_waypoint_with_detours(self, current_pos, unvisited, logger=None):
+        """Find next waypoint with detour opportunities."""
+        if not unvisited:
+            return 0, []
+
+        # Pick highest priority point
+        priority_sorted = sorted(enumerate(unvisited), key=lambda x: x[1][1])
+        highest_priority_idx = priority_sorted[0][0]
+        highest_priority_coords = unvisited[highest_priority_idx][0][:2]
+        
+        # Find detour candidates
+        detour_candidates = []
+        for i, (coords, priority, task_id) in enumerate(unvisited):
+            if i == highest_priority_idx:
                 continue
+                
+            coords_2d = coords[:2]
+            direct_distance = self.distance(current_pos, highest_priority_coords)
+            detour_distance = (self.distance(current_pos, coords_2d) + 
+                             self.distance(coords_2d, highest_priority_coords))
+            extra_distance = detour_distance - direct_distance
             
-            for dx, dy, dz in directions:
-                neighbor = (current[0] + dx, current[1] + dy, current[2] + dz)
+            near_current = self.distance(current_pos, coords_2d) <= self.nearby_radius
+            near_target = self.distance(highest_priority_coords, coords_2d) <= self.nearby_radius
+            
+            if extra_distance <= self.detour_threshold or near_current or near_target:
+                detour_candidates.append((i, extra_distance, priority, coords_2d))
                 
-                if self._is_obstacle(neighbor):
-                    continue
-                
-                # Check if neighbor is within search bounds
-                neighbor_world = self._grid_to_world(neighbor)
-                if self._distance_3d(start_pos, neighbor_world) > self.search_radius:
-                    continue
-                
-                # Calculate edge weight (Euclidean distance)
-                edge_weight = math.sqrt(dx*dx + dy*dy + dz*dz) * self.grid_size
-                new_distance = current_dist + edge_weight
-                
-                if new_distance < distances.get(neighbor, float('inf')):
-                    distances[neighbor] = new_distance
-                    previous[neighbor] = current
-                    heapq.heappush(pq, (new_distance, neighbor))
+        # Sort by extra distance and limit detours
+        detour_candidates.sort(key=lambda x: x[1])
+        max_detours = 3
+        selected_detours = detour_candidates[:max_detours]
+        detour_indices = [idx for idx, _, _, _ in selected_detours]
         
-        # No path found
-        self.logger.warning(f"[drone_{self.drone_id}] Dijkstra couldn't find path, using direct route")
-        return [start_pos, goal_pos]
-    
-    def _world_to_grid(self, pos: Tuple[float, float, float]) -> Tuple[int, int, int]:
-        """Convert world coordinates to grid coordinates"""
-        return (
-            int(pos[0] / self.grid_size),
-            int(pos[1] / self.grid_size),
-            int(pos[2] / self.grid_size)
-        )
-    
-    def _grid_to_world(self, grid_pos: Tuple[int, int, int]) -> Tuple[float, float, float]:
-        """Convert grid coordinates to world coordinates"""
-        return (
-            grid_pos[0] * self.grid_size,
-            grid_pos[1] * self.grid_size,
-            grid_pos[2] * self.grid_size
-        )
-    
-    def _distance_3d(self, pos1: Tuple[float, float, float], pos2: Tuple[float, float, float]) -> float:
-        """Calculate 3D Euclidean distance"""
-        return math.sqrt(sum((p1 - p2)**2 for p1, p2 in zip(pos1, pos2)))
-    
-    def _is_obstacle(self, grid_pos: Tuple[int, int, int]) -> bool:
-        """Check if grid position contains an obstacle"""
-        return grid_pos in self.obstacles
-    
-    def _smooth_path(self, path: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
-        """Smooth the path by removing unnecessary waypoints"""
-        if len(path) <= 2:
-            return path
-        
-        smoothed = [path[0]]
-        i = 0
-        
-        while i < len(path) - 1:
-            j = len(path) - 1
-            while j > i + 1:
-                if self._is_line_clear(path[i], path[j]):
-                    smoothed.append(path[j])
-                    i = j
-                    break
-                j -= 1
-            else:
-                smoothed.append(path[i + 1])
-                i += 1
-        
-        return smoothed
-    
-    def _is_line_clear(self, start: Tuple[float, float, float], end: Tuple[float, float, float]) -> bool:
-        """Check if line segment is clear of obstacles"""
-        steps = int(self._distance_3d(start, end) / self.grid_size) + 1
-        for i in range(steps + 1):
-            t = i / max(steps, 1)
-            point = tuple(s + t * (e - s) for s, e in zip(start, end))
-            grid_point = self._world_to_grid(point)
-            if self._is_obstacle(grid_point):
-                return False
-        return True
+        return highest_priority_idx, detour_indices
 
-class DirectPlanner(PathPlanner):
-    """Simple direct path planner"""
-    def plan(self, start, goal) -> List[Tuple[float, float, float]]:
-        self.logger.info(f"[drone_{self.drone_id}] DirectPlanner planning from {(start.x, start.y, start.z)} to {tuple(goal)}")
-        return [(start.x, start.y, start.z), tuple(goal)]
 
-class WaypointPlanner(PathPlanner):
-    """Simple waypoint planner with intermediate points"""
-    def plan(self, start, goal) -> List[Tuple[float, float, float]]:
-        start_pos = (start.x, start.y, start.z)
-        goal_pos = tuple(goal)
-        
-        # Add intermediate waypoint
-        mid_x = (start_pos[0] + goal_pos[0]) / 2
-        mid_y = (start_pos[1] + goal_pos[1]) / 2
-        mid_z = max(start_pos[2], goal_pos[2]) + 5  # Higher altitude
-        
-        self.logger.info(f"[drone_{self.drone_id}] WaypointPlanner planning with intermediate point {(mid_x, mid_y, mid_z)}")
-        return [start_pos, (mid_x, mid_y, mid_z), goal_pos]
-
-class AvoidancePlanner(PathPlanner):
-    """Simple avoidance planner that goes around obstacles"""
-    def plan(self, start, goal) -> List[Tuple[float, float, float]]:
-        start_pos = (start.x, start.y, start.z)
-        goal_pos = tuple(goal)
-        
-        # Simple avoidance: go up, then to goal, then down
-        safe_altitude = 15.0
-        waypoints = [
-            start_pos,
-            (start_pos[0], start_pos[1], safe_altitude),
-            (goal_pos[0], goal_pos[1], safe_altitude),
-            goal_pos
-        ]
-        
-        self.logger.info(f"[drone_{self.drone_id}] AvoidancePlanner planning with safe altitude {safe_altitude}")
-        return waypoints
-
-class PlannerSelector(Node):
+class FireDataPlanner(Node):
     def __init__(self, drone_id: str):
-        super().__init__(f'planner_selector_drone_{drone_id}')
+        super().__init__(f'fire_planner_drone_{drone_id}')
         self.drone_id = drone_id
-        
-        # QoS profile for subscriptions
+
+        # Use consistent QoS settings
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
-        
-        # Subscribe to LIDAR data
-        self.lidar_sub = self.create_subscription(
-            LaserScan, f'/drone_{drone_id}/scan', self.lidar_callback, qos
-        )
-        self.lidar_ranges = []
-        
+
         # Subscribe to drone pose
+        self.pose_subscription = self.create_subscription(
+            PoseStamped, f'/drone_{drone_id}/mavros/local_position/pose', self.pose_callback, qos)
+
+        # Subscribe to fire data
+        self.fire_data_subscription = self.create_subscription(
+            String, '/fire_data', self.fire_data_callback, qos)
+
+        # Publish planned path
+        # Publish planned path
+        self.path_pub = self.create_publisher(Path, f'/fire_planner_path_drone_{drone_id}', qos)
+
+        # State variables
         self.current_pose = None
-        self.pose_sub = self.create_subscription(
-            PoseStamped, f'/drone_{drone_id}/pose', self.pose_callback, qos
+        self.all_tasks = []
+        self.path_published = False
+
+        # Planner instance
+        self.planner = MultiWaypointPlanner(
+            detour_threshold=25.0,
+            nearby_radius=35.0
         )
-        
-        self.get_logger().info(f"PlannerSelector initialized for drone_{drone_id}")
+
+        # Timer to republish path periodically (helps with QoS issues)
+        self.publish_timer = self.create_timer(3.0, self.republish_path)
+
+        self.get_logger().info(f"🔥 Fire Data Planner initialized for drone_{drone_id}")
+        self.get_logger().info("Waiting for fire data and drone pose...")
 
     def pose_callback(self, msg: PoseStamped):
-        """Store current drone pose"""
-        self.current_pose = msg.pose
-        self.get_logger().debug(f"[drone_{self.drone_id}] Received pose: x={msg.pose.position.x}, y={msg.pose.position.y}, z={msg.pose.position.z}")
+        """Handle pose updates from drone."""
+        was_none = self.current_pose is None
+        self.current_pose = msg
+        
+        if was_none:
+            self.get_logger().info(f"✅ Received initial pose: ({msg.pose.position.x:.1f}, {msg.pose.position.y:.1f}, {msg.pose.position.z:.1f})")
+        
+        # Try to plan path if we have both pose and tasks
+        if self.all_tasks and not self.path_published:
+            self.plan_and_publish_path()
 
-    def lidar_callback(self, msg: LaserScan):
-        """Store LIDAR data"""
-        self.lidar_ranges = msg.ranges
-        self.get_logger().debug(f"[drone_{self.drone_id}] Received LIDAR data with {len(self.lidar_ranges)} ranges")
+    def fire_data_callback(self, msg: String):
+        """Handle fire data and build task list."""
+        try:
+            data = json.loads(msg.data)
+            task_id = data.get('task_id')
+            lat = data.get('lat')
+            lon = data.get('lon')
+            landcover_grid = data.get('landcover_grid_50m', [])
 
-    def _lidar_to_obstacles(self) -> set:
-        """Convert LIDAR ranges to obstacle grid positions, only for drone_1"""
-        if self.drone_id != '1':
-            self.get_logger().info(f"[drone_{self.drone_id}] No obstacle processing (drone_id != 1)")
-            return set()
-        
-        obstacles = set()
-        if not self.lidar_ranges or not self.current_pose:
-            self.get_logger().warning(f"[drone_{self.drone_id}] No LIDAR data or pose available")
-            return obstacles
-        
-        for i, r in enumerate(self.lidar_ranges):
-            if math.isinf(r) or r < 0.1 or r > 20.0:  # Ignore invalid ranges
-                continue
-            angle = -3.14159 + i * (2 * 3.14159 / 360)  # Convert index to angle
-            x = self.current_pose.position.x + r * math.cos(angle)
-            y = self.current_pose.position.y + r * math.sin(angle)
-            z = self.current_pose.position.z
-            grid_pos = (int(x / 2.0), int(y / 2.0), int(z / 2.0))  # 2m grid cells to match AStar/Dijkstra
-            obstacles.add(grid_pos)
-        
-        self.get_logger().info(f"[drone_{self.drone_id}] Detected {len(obstacles)} obstacles from LIDAR")
-        return obstacles
+            if not task_id or lat is None or lon is None:
+                self.get_logger().warning(f"Incomplete fire_data: {data}")
+                return
 
-    def _estimate_obstacle_density(self, drone_poses: Dict, start: Tuple[float, float, float], 
-                                 goal: Tuple[float, float, float]) -> float:
-        """Estimate obstacle density"""
-        volume = 50.0 * 50.0 * 20.0
-        obstacles = self._lidar_to_obstacles()
-        num_obstacles = len(obstacles)
-        self.get_logger().info(f"[drone_{self.drone_id}] Total obstacles: {num_obstacles}, density: {num_obstacles / volume}")
-        return num_obstacles / volume
+            self.get_logger().info(f"🔥 Processing fire data: {task_id} with {len(landcover_grid)} grid points")
 
-    def select_planner(self, fire_data: dict, start: Tuple[float, float, float], 
-                      goal: Tuple[float, float, float], drone_poses: Dict, 
-                      time_constraint: float) -> PathPlanner:
-        """Select planner based on fire priority and obstacle density"""
-        density = self._estimate_obstacle_density(drone_poses, start, goal)
-        priority = fire_data.get('priority_level', 5)
-        obstacles = self._lidar_to_obstacles()
-        
-        # Update obstacles for all planners
-        planner_instances = {
-            'astar': AStarPlanner(self.drone_id, self.get_logger()),
-            'rrtstar': RRTStarPlanner(self.drone_id, self.get_logger()),
-            'dijkstra': DijkstraPlanner(self.drone_id, self.get_logger()),
-            'direct': DirectPlanner(self.drone_id, self.get_logger()),
-            'waypoint': WaypointPlanner(self.drone_id, self.get_logger()),
-            'avoidance': AvoidancePlanner(self.drone_id, self.get_logger())
-        }
-        for planner in planner_instances.values():
-            planner.obstacles = obstacles
-        
-        if priority <= 2:  # High-priority fire
-            self.get_logger().info(f"[drone_{self.drone_id}] Selecting AStarPlanner due to high priority ({priority})")
-            return planner_instances['astar']
-        elif density > 0.1:  # High obstacle density
-            self.get_logger().info(f"[drone_{self.drone_id}] Selecting RRTStarPlanner due to high density ({density})")
-            return planner_instances['rrtstar']
-        elif time_constraint < 30.0:  # Tight time constraint
-            self.get_logger().info(f"[drone_{self.drone_id}] Selecting DirectPlanner due to time constraint ({time_constraint})")
-            return planner_instances['direct']
-        elif density > 0.05:  # Moderate obstacle density
-            self.get_logger().info(f"[drone_{self.drone_id}] Selecting DijkstraPlanner due to moderate density ({density})")
-            return planner_instances['dijkstra']
-        elif priority <= 3:  # Medium-priority fire
-            self.get_logger().info(f"[drone_{self.drone_id}] Selecting WaypointPlanner due to medium priority ({priority})")
-            return planner_instances['waypoint']
+            # Convert grid points to tasks with urban priority
+            points_with_urban_pct = []
+            for pt in landcover_grid:
+                x, y = latlon_to_xy(pt['lat'], pt['lon'])
+                urban_pct = 0.0
+                if pt['class_code'] == 50:  # Built-up areas
+                    urban_pct = pt.get('class_pct_coverage', 0.0)
+                points_with_urban_pct.append((urban_pct, (x, y, 50.0)))
+
+            # Sort by urban percentage (highest first)
+            points_with_urban_pct.sort(key=lambda x: x[0], reverse=True)
+
+            # Create task list: (priority, task_id, coords)
+            # Use negative urban_pct for priority (lower = higher priority)
+            new_tasks = []
+            for i, (urban_pct, coords) in enumerate(points_with_urban_pct):
+                priority = -urban_pct  # Negative so lower = higher priority
+                sub_task_id = f"{task_id}_point_{i:02d}"
+                new_tasks.append((priority, sub_task_id, coords))
+
+            # Add to task list and sort by priority
+            self.all_tasks.extend(new_tasks)
+            self.all_tasks.sort(key=lambda x: x[0])  # Sort by priority (most urgent first)
+
+            urban_count = sum(1 for urban_pct, _ in points_with_urban_pct if urban_pct > 0)
+            self.get_logger().info(f"📊 Added {len(new_tasks)} tasks ({urban_count} urban areas)")
+            self.get_logger().info(f"📋 Total tasks: {len(self.all_tasks)}")
+            
+            # Show top priorities
+            self.get_logger().info("🏆 Top 5 priority areas:")
+            for i, (priority, task_id, coords) in enumerate(self.all_tasks[:5]):
+                self.get_logger().info(f"   {i+1}. {task_id}: {-priority:.1f}% urban at ({coords[0]:.1f}, {coords[1]:.1f})")
+
+            # Reset path published flag to trigger new planning
+            self.path_published = False
+            
+            # Try to plan path if we have pose
+            if self.current_pose:
+                self.plan_and_publish_path()
+
+        except Exception as e:
+            self.get_logger().error(f"❌ Error processing fire_data: {e}")
+
+    def plan_and_publish_path(self):
+        """Plan complete path and publish it."""
+        if not self.current_pose or not self.all_tasks or self.path_published:
+            return
+
+        start_pos = (
+            self.current_pose.pose.position.x,
+            self.current_pose.pose.position.y,
+            self.current_pose.pose.position.z
+        )
+
+        self.get_logger().info(f"🗺️  Planning complete path from ({start_pos[0]:.1f}, {start_pos[1]:.1f})")
+        self.get_logger().info(f"🎯 Will visit {len(self.all_tasks)} fire response locations")
+
+        # Plan the complete multi-waypoint path
+        complete_path = self.planner.plan_multi_waypoint_path(
+            start_pos, self.all_tasks, self.get_logger()
+        )
+
+        if complete_path:
+            # Publish the path
+            self.publish_path(complete_path)
+            self.path_published = True
+            
+            self.get_logger().info(f"✅ Published complete path with {len(complete_path)} waypoints")
+            self.log_path_summary(complete_path)
         else:
-            self.get_logger().info(f"[drone_{self.drone_id}] Selecting AvoidancePlanner")
-            return planner_instances['avoidance']
+            self.get_logger().error("❌ Failed to generate path")
+
+    def publish_path(self, waypoint_list):
+        """Publish path as ROS Path message."""
+        path_msg = Path()
+        path_msg.header.frame_id = "map"
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        
+        for i, waypoint in enumerate(waypoint_list):
+            pose = PoseStamped()
+            pose.header.frame_id = "map"
+            
+            pose.pose.position.x = float(waypoint[0])
+            pose.pose.position.y = float(waypoint[1])
+            pose.pose.position.z = 50.0  # Fixed altitude
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+        
+        self.path_pub.publish(path_msg)
+        self.get_logger().info(f"📡 Path published: {len(path_msg.poses)} waypoints sent to drone controller")
+
+    def republish_path(self):
+        """Periodically republish path to help with reliability."""
+        if self.path_published and self.all_tasks:
+            # Only republish if we have a planned path
+            if self.current_pose:
+                start_pos = (
+                    self.current_pose.pose.position.x,
+                    self.current_pose.pose.position.y,
+                    self.current_pose.pose.position.z
+                )
+                complete_path = self.planner.plan_multi_waypoint_path(
+                    start_pos, self.all_tasks, None  # Don't log details on republish
+                )
+                if complete_path:
+                    self.publish_path(complete_path)
+                    self.get_logger().debug(f"🔄 Republished path with {len(complete_path)} waypoints")
+
+    def log_path_summary(self, path):
+        """Log a summary of the planned path."""
+        if len(path) < 2:
+            return
+            
+        self.get_logger().info("📍 Path Summary:")
+        total_distance = 0.0
+        
+        # Show first few waypoints
+        for i in range(min(3, len(path))):
+            wp = path[i]
+            if i == 0:
+                self.get_logger().info(f"   START: ({wp[0]:.1f}, {wp[1]:.1f})")
+            else:
+                prev_wp = path[i-1]
+                dist = math.sqrt((wp[0] - prev_wp[0])**2 + (wp[1] - prev_wp[1])**2)
+                total_distance += dist
+                self.get_logger().info(f"   WP {i}: ({wp[0]:.1f}, {wp[1]:.1f}) [{dist:.1f}m]")
+        
+        # Calculate total distance
+        for i in range(1, len(path)):
+            if i >= 3:  # Already calculated first few
+                prev_wp = path[i-1]
+                wp = path[i]
+                dist = math.sqrt((wp[0] - prev_wp[0])**2 + (wp[1] - prev_wp[1])**2)
+                total_distance += dist
+        
+        if len(path) > 3:
+            self.get_logger().info(f"   ... ({len(path)-3} more waypoints)")
+            # Show last waypoint
+            last_wp = path[-1]
+            self.get_logger().info(f"   END: ({last_wp[0]:.1f}, {last_wp[1]:.1f})")
+        
+        avg_distance = total_distance / (len(path) - 1) if len(path) > 1 else 0
+        self.get_logger().info(f"📏 Total distance: {total_distance:.1f}m, Average segment: {avg_distance:.1f}m")
+
 
 def main(args=None):
     rclpy.init(args=args)
     import sys
-    drone_id = sys.argv[1] if len(sys.argv) > 1 else '1'
-    planner_selector = PlannerSelector(drone_id)
-    rclpy.spin(planner_selector)
-    planner_selector.destroy_node()
-    rclpy.shutdown()
+    
+    if len(sys.argv) < 2:
+        print("Usage: python3 fire_planner.py <drone_id>")
+        print("Example: python3 fire_planner.py 1")
+        sys.exit(1)
+    
+    drone_id = sys.argv[1]
+    planner = FireDataPlanner(drone_id)
+
+    try:
+        planner.get_logger().info(f"🚀 Fire Data Planner started for drone_{drone_id}")
+        planner.get_logger().info("Ready to receive fire data and plan complete paths!")
+        rclpy.spin(planner)
+    except KeyboardInterrupt:
+        planner.get_logger().info("🛑 Shutting down...")
+    finally:
+        planner.destroy_node()
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
-
