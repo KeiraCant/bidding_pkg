@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../../../../ardupilot_gazebo/models/iris_with_lidar"
+		},
+		{
+			"path": "../../../../ardupilot_gazebo/worlds"
 		}
 	],
 	"settings": {}
