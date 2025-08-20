@@ -9,26 +9,32 @@ class AllocatorNode(Node):
     def __init__(self):
         super().__init__('allocator_node')
 
-        self.active_tasks = {}  # task_id -> list of (drone_id, bid_score, location)
-        self.task_timers = {}  # task_id -> timer start time
-        self.pending_tasks = []  # queue of task_ids
-        self.busy_drones = set()  # set of drone_ids
-        self.bid_timeout = 10.0  # Wait 10 seconds for bids
+        # Task tracking
+        self.active_tasks = {}      # task_id -> list of (drone_id, bid_score, location)
+        self.task_timers = {}       # task_id -> bid start time
+        self.pending_tasks = []     # queue of task_ids
+        self.busy_drones = set()    # set of busy drone_ids
+        self.bid_timeout = 10.0     # seconds to wait for bids
+        self.task_priorities = {}   # task_id -> fire priority (info only)
 
+        # QoS for publishers/subscribers
         assignment_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             depth=10
         )  
 
+        # Publishers and subscriptions
         self.assignment_pub = self.create_publisher(String, '/assignments', assignment_qos)
         self.create_subscription(String, '/bids', self.bid_callback, 10)
         self.create_subscription(String, '/task_done', self.task_done_callback, assignment_qos)
+        self.create_subscription(String, '/fire_priority', self.fire_priority_callback, assignment_qos)
 
-        # Timer to check for expired bid periods
+        # Timer to check for expired bids
         self.check_timer = self.create_timer(1.0, self.check_expired_tasks)
 
-        self.get_logger().info("Allocator node with 10-second bid timer ready.")
+        self.get_logger().info("Allocator node ready. Fire priority included in assignments for info only.")
 
+    # --- Drone state helpers ---
     def drone_busy(self, drone_id):
         return drone_id in self.busy_drones
 
@@ -38,6 +44,18 @@ class AllocatorNode(Node):
     def mark_drone_free(self, drone_id):
         self.busy_drones.discard(drone_id)
 
+    # --- Fire priority callback (info only) ---
+    def fire_priority_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+            task_id = data['task_id']
+            priority = data['priority']
+            self.task_priorities[task_id] = priority
+            self.get_logger().info(f"🔥 Received priority {priority:.3f} for task {task_id}")
+        except Exception as e:
+            self.get_logger().error(f"❌ Error parsing /fire_priority: {e}")
+
+    # --- Handle incoming bids ---
     def bid_callback(self, msg):
         try:
             bid = json.loads(msg.data)
@@ -52,7 +70,6 @@ class AllocatorNode(Node):
                 self.get_logger().info(f"⏰ Started 10-second bid timer for task {task_id}")
 
             self.active_tasks[task_id].append((drone_id, bid_score, location))
-
             self.get_logger().info(
                 f"\n📨 New bid received:\n"
                 f"  🔧 Task ID: {task_id}\n"
@@ -62,7 +79,7 @@ class AllocatorNode(Node):
                 f"  📊 Total bids for this task: {len(self.active_tasks[task_id])}"
             )
 
-            # Check if we have all 3 drones bidding
+            # If 3 bids received, assign immediately
             if len(self.active_tasks[task_id]) >= 3:
                 self.get_logger().info(f"✅ All 3 drones have bid on task {task_id}, assigning immediately")
                 self.try_assign_task(task_id)
@@ -70,32 +87,28 @@ class AllocatorNode(Node):
         except Exception as e:
             self.get_logger().error(f"❌ Error in bid_callback: {e}")
 
+    # --- Check for expired bid timers ---
     def check_expired_tasks(self):
         current_time = time.time()
-        expired_tasks = []
-        
-        for task_id, start_time in self.task_timers.items():
-            if current_time - start_time >= self.bid_timeout:
-                expired_tasks.append(task_id)
-        
+        expired_tasks = [task_id for task_id, start in self.task_timers.items()
+                         if current_time - start >= self.bid_timeout]
+
         for task_id in expired_tasks:
             if task_id in self.active_tasks and len(self.active_tasks[task_id]) > 0:
                 self.get_logger().info(f"⏰ Bid timer expired for task {task_id} with {len(self.active_tasks[task_id])} bids")
                 self.try_assign_task(task_id)
             else:
                 # Clean up if no bids received
-                if task_id in self.task_timers:
-                    del self.task_timers[task_id]
-                if task_id in self.active_tasks:
-                    del self.active_tasks[task_id]
+                self.task_timers.pop(task_id, None)
+                self.active_tasks.pop(task_id, None)
+                self.task_priorities.pop(task_id, None)
 
+    # --- Try assigning a task if eligible drones exist ---
     def try_assign_task(self, task_id):
         if task_id not in self.active_tasks:
             return
 
-        eligible_bids = [
-            b for b in self.active_tasks[task_id] if not self.drone_busy(b[0])
-        ]
+        eligible_bids = [b for b in self.active_tasks[task_id] if not self.drone_busy(b[0])]
 
         if not eligible_bids:
             self.get_logger().warn(
@@ -107,33 +120,34 @@ class AllocatorNode(Node):
 
         self.assign_task(task_id, eligible_bids)
 
+    # --- Assign task based solely on bid score ---
     def assign_task(self, task_id, eligible_bids):
         if task_id not in self.active_tasks:
-            self.get_logger().warn(f"Task {task_id} already assigned or not active.")
             return
 
-        best = min(eligible_bids, key=lambda x: x[1])  # lowest bid_score wins
-        drone_id = best[0]
-        location = best[2]
+        # Select the drone with lowest bid score
+        best = min(eligible_bids, key=lambda x: x[1])
+        drone_id, bid_score, location = best
 
         assignment = {
             'task_id': task_id,
             'drone_id': drone_id,
-            'location': location
+            'location': location,
+            'priority': self.task_priorities.get(task_id, 0.0)  # info only
         }
 
         self.assignment_pub.publish(String(data=json.dumps(assignment)))
-        self.get_logger().info(f"✅ Assigned {task_id} to {drone_id} (bid score: {best[1]:.2f})")
+        self.get_logger().info(f"✅ Assigned {task_id} to {drone_id} (bid: {bid_score:.2f}, priority: {assignment['priority']:.3f})")
 
         self.mark_drone_busy(drone_id)
 
-        # Clean up task data
-        del self.active_tasks[task_id]
-        if task_id in self.task_timers:
-            del self.task_timers[task_id]
-        if task_id in self.pending_tasks:
-            self.pending_tasks.remove(task_id)
+        # Cleanup task
+        self.active_tasks.pop(task_id, None)
+        self.task_timers.pop(task_id, None)
+        self.pending_tasks = [t for t in self.pending_tasks if t != task_id]
+        self.task_priorities.pop(task_id, None)
 
+    # --- Handle task completion ---
     def task_done_callback(self, msg):
         try:
             data = json.loads(msg.data)
@@ -143,21 +157,17 @@ class AllocatorNode(Node):
             self.mark_drone_free(drone_id)
             self.get_logger().info(f"🔓 Drone {drone_id} completed task {task_id}, marked as free.")
 
-            # Try to assign any pending tasks
+            # Attempt pending assignments
             if self.pending_tasks:
-                next_task_id = self.pending_tasks[0]  # Don't pop yet
-                self.get_logger().info(f"🔄 Trying to assign pending task {next_task_id}")
-                
+                next_task_id = self.pending_tasks[0]
                 if next_task_id in self.active_tasks:
-                    eligible_bids = [
-                        b for b in self.active_tasks[next_task_id] if not self.drone_busy(b[0])
-                    ]
+                    eligible_bids = [b for b in self.active_tasks[next_task_id] if not self.drone_busy(b[0])]
                     if eligible_bids:
-                        self.pending_tasks.pop(0)  # Remove from pending only if we can assign
+                        self.pending_tasks.pop(0)
                         self.assign_task(next_task_id, eligible_bids)
 
         except Exception as e:
-            self.get_logger().error(f"Error parsing /task_done message: {e}")
+            self.get_logger().error(f"❌ Error parsing /task_done message: {e}")
 
 def main(args=None):
     rclpy.init(args=args)

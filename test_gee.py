@@ -5,20 +5,11 @@ from std_msgs.msg import String
 import json
 import math
 import ee
+import os
+import csv
 
 # Initialize Earth Engine with your project
 ee.Initialize(project='wildfirethesis')
-
-# Your known base location (origin for relative offsets)
-BASE_LAT = 63.4188137258128
-BASE_LON = 10.401553034756608
-
-def offset_to_latlon(base_lat, base_lon, dx_m, dy_m):
-    """Convert offset in meters (dx east, dy north) to lat/lon."""
-    R = 6378137  # Earth radius in meters
-    new_lat = base_lat + (dy_m / R) * (180 / math.pi)
-    new_lon = base_lon + (dx_m / (R * math.cos(math.pi * base_lat / 180))) * (180 / math.pi)
-    return new_lat, new_lon
 
 class FireDataNode(Node):
     def __init__(self):
@@ -34,6 +25,9 @@ class FireDataNode(Node):
 
         # Publisher for fire data
         self.fire_data_pub = self.create_publisher(String, '/fire_data', qos)
+
+        # Publisher for fire priority
+        self.fire_priority_pub = self.create_publisher(String, '/fire_priority', qos)
 
         self.get_logger().info("🔥 Fire Data Node started, waiting for /fire_tasks...")
 
@@ -89,91 +83,124 @@ class FireDataNode(Node):
         else:
             self.modis_veg_img = modis_img.select('LC_Type1')
 
-    def query_ee_grid_50m(self, lat, lon):
+        # CSV file for raw fire data
+        self.raw_csv_path = os.path.expanduser('~/fire_data_raw.csv')
+        if not os.path.exists(self.raw_csv_path):
+            with open(self.raw_csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['task_id','lat','lon','class_code','class_name','class_pct_coverage'])
+
+    def query_ee_grid_50m(self, fire_lat, fire_lon):
         try:
-            half_size = 25  # meters (half of 50m)
-            lat1, lon1 = offset_to_latlon(lat, lon, -half_size, -half_size)
-            lat2, lon2 = offset_to_latlon(lat, lon, half_size, half_size)
-            region = ee.Geometry.Rectangle([lon1, lat1, lon2, lat2])
+            half_box_degrees = 0.00045
+            region = ee.Geometry.Rectangle([
+                fire_lon - half_box_degrees,
+                fire_lat - half_box_degrees,
+                fire_lon + half_box_degrees,
+                fire_lat + half_box_degrees
+            ])
 
             img = ee.Image('ESA/WorldCover/v200/2021').select('Map')
-
-            sampled = img.sample(
-                region=region,
-                scale=10,
-                geometries=True
-            )
-
+            sampled = img.sample(region=region, scale=10, geometries=True)
             features = sampled.getInfo()['features']
+
+            if not features:
+                self.get_logger().warning(f"⚠️ No landcover data found at ({fire_lat:.6f}, {fire_lon:.6f})")
+                return []
+
             class_counts = {}
             for f in features:
                 val = f['properties']['Map']
                 class_counts[val] = class_counts.get(val, 0) + 1
 
-            total_pixels = sum(class_counts.values()) or 1
+            total_pixels = sum(class_counts.values())
             grid_data = []
-
             for f in features:
                 coords = f['geometry']['coordinates']
-                val = f['properties']['Map']
-                class_name = self.landcover_map.get(val, f"Unknown({val})")
-                pct_coverage = (class_counts[val] / total_pixels) * 100.0
-                cell_data = {
-                    'lon': coords[0],
+                landcover_class = f['properties']['Map']
+                class_name = self.landcover_map.get(landcover_class, f"Unknown({landcover_class})")
+                pct_coverage = (class_counts[landcover_class] / total_pixels) * 100.0
+                grid_data.append({
                     'lat': coords[1],
-                    'class_code': val,
+                    'lon': coords[0],
+                    'class_code': landcover_class,
                     'class_name': class_name,
-                    'class_pct_coverage': pct_coverage 
-                }
-
-                self.get_logger().info(
-                    f"Cell data: lon={coords[0]:.6f}, lat={coords[1]:.6f}, "
-                    f"class_code={val}, class_name={class_name}, "
-                    f"pct_coverage={pct_coverage:.2f}%"
-                )
-
-                grid_data.append(cell_data)
-
+                    'class_pct_coverage': pct_coverage
+                })
+            self.get_logger().info(f"📊 Sampled {len(grid_data)} points in 50x50m around fire location")
             return grid_data
+
         except Exception as e:
-            self.get_logger().error(f"EE 50m grid query failed: {e}")
+            self.get_logger().error(f"❌ Earth Engine query failed: {e}")
             return []
+
+    def calculate_priority(self, grid_data):
+        try:
+            urban_pixels = sum(1 for cell in grid_data if cell['class_code'] == 50)
+            total_pixels = len(grid_data)
+            priority = urban_pixels / total_pixels if total_pixels > 0 else 0.0
+            return priority
+        except Exception as e:
+            self.get_logger().error(f"❌ Error calculating priority: {e}")
+            return 0.0
 
     def fire_task_callback(self, msg):
         try:
             fire_task = json.loads(msg.data)
+            task_id = fire_task.get('task_id')
             location = fire_task.get('location')
 
-            # Convert relative location to lat/lon if needed
             if isinstance(location, list) and len(location) >= 2:
-                dx_m, dy_m = location[0], location[1]
-                lat, lon = offset_to_latlon(BASE_LAT, BASE_LON, dx_m, dy_m)
+                fire_lat, fire_lon = location[0], location[1]
             elif isinstance(location, dict):
-                lat = location.get('lat')
-                lon = location.get('lon')
+                fire_lat = location.get('lat')
+                fire_lon = location.get('lon')
             else:
-                self.get_logger().warning(f"Invalid location format: {location}")
+                self.get_logger().warning(f"❌ Invalid location format: {location}")
                 return
 
-            self.get_logger().info(f"📍 Fire task {fire_task.get('task_id')} at {lat:.6f}, {lon:.6f}")
+            self.get_logger().info(f"🔥 Processing {task_id} at ({fire_lat:.6f}, {fire_lon:.6f})")
 
-            grid_data = self.query_ee_grid_50m(lat, lon)
+            grid_data = self.query_ee_grid_50m(fire_lat, fire_lon)
+            if not grid_data:
+                self.get_logger().warning(f"⚠️ No landcover data for {task_id}")
+                return
 
             result = {
-                'task_id': fire_task.get('task_id'),
-                'lat': lat,
-                'lon': lon,
+                'task_id': task_id,
+                'lat': fire_lat,
+                'lon': fire_lon,
                 'landcover_grid_50m': grid_data
             }
 
-            result_msg = String()
-            result_msg.data = json.dumps(result)
-            self.fire_data_pub.publish(result_msg)
+            self.fire_data_pub.publish(String(data=json.dumps(result)))
+            self.get_logger().info(f"✅ Published landcover data for {task_id}: {len(grid_data)} sample points")
 
-            self.get_logger().info(f"✅ Published 50m grid fire data for task {fire_task.get('task_id')}")
+            # Publish priority as before
+            priority = self.calculate_priority(grid_data)
+            priority_msg = {'task_id': task_id, 'priority': priority}
+            self.fire_priority_pub.publish(String(data=json.dumps(priority_msg)))
+            self.get_logger().info(f"📊 Priority for {task_id}: {priority:.3f}")
+
+            # --- NEW: write raw data to CSV ---
+            try:
+                with open(self.raw_csv_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    for cell in grid_data:
+                        writer.writerow([
+                            task_id,
+                            cell['lat'],
+                            cell['lon'],
+                            cell['class_code'],
+                            cell['class_name'],
+                            cell['class_pct_coverage']
+                        ])
+                self.get_logger().info(f"📝 Raw fire data for {task_id} written to {self.raw_csv_path}")
+            except Exception as e:
+                self.get_logger().error(f"❌ Error writing raw CSV: {e}")
 
         except Exception as e:
-            self.get_logger().error(f"Error processing fire task: {e}")
+            self.get_logger().error(f"❌ Error processing fire task: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
@@ -188,4 +215,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

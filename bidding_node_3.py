@@ -1,41 +1,41 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
-from visualization_msgs.msg import Marker
 import json
-import random
-from rclpy.qos import QoSProfile, ReliabilityPolicy
 import math
+from sensor_msgs.msg import NavSatFix
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 class BiddingNode(Node):
+    """Node that calculates bid scores for fire tasks based on drone GPS position."""
     def __init__(self, drone_id):
         super().__init__('bidding_node_' + drone_id)
         self.drone_id = drone_id
         self.current_task = None
-        self.position = None  # Drone's local pose [x, y, z]
-        self.initialized = False
+        self.current_gps = None  # Drone GPS: [lat, lon, alt]
+        self.got_initial_gps = False
 
-        best_effort_qos = QoSProfile(
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
 
-        # Subscribe to drone local position pose
+        # Subscribe to drone GPS
         self.create_subscription(
-            PoseStamped,
-            f'/{drone_id}/mavros/local_position/pose',
-            self.pose_callback,
-            best_effort_qos
+            NavSatFix,  
+            f'/{drone_id}/mavros/global_position/global',
+            self.gps_callback,
+            qos
         )
 
-        # Subscribe to fire tasks with GPS locations
+        # Subscribe to fire tasks
         self.create_subscription(
             String,
             '/fire_tasks',
             self.fire_callback,
-            best_effort_qos
+            qos
         )
 
         # Subscribe to assignments
@@ -43,7 +43,7 @@ class BiddingNode(Node):
             String,
             '/assignments',
             self.assignment_callback,
-            best_effort_qos
+            qos
         )
 
         # Subscribe to task completion messages
@@ -51,124 +51,87 @@ class BiddingNode(Node):
             String,
             '/task_done',
             self.task_done_callback,
-            best_effort_qos
+            qos
         )
 
-        # Publishers
+        # Publisher for bids
         self.bid_pub = self.create_publisher(String, '/bids', 10)
-        self.done_pub = self.create_publisher(String, '/task_done', 10)
-        self.path_pub = self.create_publisher(Path, f'/planned_path_{drone_id}', 10)
-        self.setpoint_pub = self.create_publisher(PoseStamped, f'/{drone_id}/mavros/setpoint_position/local', 10)
 
-        self.get_logger().info(f"🚁 {drone_id} bidding node started and waiting for pose...")
+        self.get_logger().info(f"🚁 {drone_id} bidding node started, waiting for GPS...")
 
-        # Reference origin for local frame, must match FireTaskPublisher sim_center
-        self.sim_center_lat = 63.4188137258128
-        self.sim_center_lon = 10.401553034756608
+    def gps_callback(self, msg):
+        """Update current GPS position."""
+        self.current_gps = [msg.latitude, msg.longitude, msg.altitude]
 
-    def pose_callback(self, msg):
-        self.position = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
-        if not self.initialized:
-            self.get_logger().info(f"{self.drone_id} initialized at position {self.position}")
-            self.initialized = True
+        # Log initial GPS only once
+        if not self.got_initial_gps:
+            self.get_logger().info(f"📡 Initial GPS: {self.current_gps}")
+            self.got_initial_gps = True
 
-    def gps_to_local(self, lat, lon):
-        delta_lat = lat - self.sim_center_lat
-        delta_lon = lon - self.sim_center_lon
+    def haversine_distance(self, lat1, lon1, lat2, lon2):
+        """Calculate distance (meters) between two GPS coordinates."""
+        R = 6371000  # Earth radius in meters
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lon2 - lon1)
 
-        meters_per_deg_lat = 110540
-        meters_per_deg_lon = 111320 * math.cos(math.radians(self.sim_center_lat))
+        a = math.sin(delta_phi/2.0)**2 + \
+            math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2.0)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-        x_local = delta_lon * meters_per_deg_lon
-        y_local = delta_lat * meters_per_deg_lat
-
-        return [x_local, y_local, 0.0]
-
-    def euclidean_distance(self, pos1, pos2):
-        return math.sqrt(
-            (pos1[0] - pos2[0])**2 +
-            (pos1[1] - pos2[1])**2 +
-            (pos1[2] - pos2[2])**2
-        )
+        return R * c
 
     def distance_to_bid_score(self, distance):
-        # Bid score inversely proportional to distance (closer fires get higher bids)
-        # For example: max score 100, min 1, with a max considered distance of 2000 m
+        """Convert distance to bid score: closer fires = higher bid."""
         max_distance = 2000.0
         normalized = max(0.0, min(1.0, 1 - (distance / max_distance)))
-        bid_score = int(normalized * 99) + 1
-        return bid_score
+        return int(normalized * 99) + 1
 
     def fire_callback(self, msg):
-        if self.current_task is not None or not self.initialized:
+        """Send bid for the closest fire task if not already assigned."""
+        if self.current_task is not None or self.current_gps is None:
             return
 
         fire = json.loads(msg.data)
-        fire_lat, fire_lon = fire['location']
+        fire_lat, fire_lon = fire['location'][:2]
 
-        if self.position is None:
-            self.get_logger().warn("Position not yet available, skipping bid.")
-            return
-
-        fire_local = self.gps_to_local(fire_lat, fire_lon)
-        dist = self.euclidean_distance(self.position, fire_local)
+        dist = self.haversine_distance(self.current_gps[0], self.current_gps[1],
+                                       fire_lat, fire_lon)
         bid_score = self.distance_to_bid_score(dist)
 
         bid = {
             'task_id': fire['task_id'],
             'drone_id': self.drone_id,
             'bid_score': bid_score,
-            'location': fire['location']  # Keep GPS coords here
+            'location': fire['location']  # Keep GPS coords
         }
 
         self.bid_pub.publish(String(data=json.dumps(bid)))
-        self.get_logger().info(f"Sent bid for task {fire['task_id']} based on distance {dist:.2f} m: {bid}")
+        # Log GPS only when submitting a bid
+        self.get_logger().info(f"📡 Submitting bid from GPS: {self.current_gps}")
+        self.get_logger().info(f"Sent bid for task {fire['task_id']} at distance {dist:.1f} m: {bid}")
 
     def assignment_callback(self, msg):
         assignment = json.loads(msg.data)
-        if assignment['drone_id'] == self.drone_id and self.current_task is None:
-            task_id = assignment['task_id']
-            fire_loc = assignment['location']
-
-            self.current_task = task_id
-            self.get_logger().info(f"Assigned task {task_id}. Planning path...")
-
-            self.publish_path(self.position, self.gps_to_local(fire_loc[0], fire_loc[1]))
+        if assignment['drone_id'] == self.drone_id:
+            self.current_task = assignment['task_id']
+            self.get_logger().info(f"Assigned task {self.current_task}.")
 
     def task_done_callback(self, msg):
-        self.get_logger().info(f"📥 Received task_done message: {msg.data}")
         try:
             data = json.loads(msg.data)
             if data['drone_id'] == self.drone_id and self.current_task == data['task_id']:
                 self.get_logger().info(f"✅ Task {data['task_id']} complete. Resetting current task.")
                 self.current_task = None
         except Exception as e:
-            self.get_logger().error(f"❗ Error processing task completion: {e}")
-
-    def publish_path(self, start, goal):
-        path_msg = Path()
-        path_msg.header.frame_id = "map"
-        path_msg.header.stamp = self.get_clock().now().to_msg()
-
-        for point in [start, goal]:
-            pose = PoseStamped()
-            pose.header.frame_id = "map"
-            pose.header.stamp = self.get_clock().now().to_msg()
-            pose.pose.position.x = float(point[0])
-            pose.pose.position.y = float(point[1])
-            pose.pose.position.z = float(point[2])
-            pose.pose.orientation.w = 1.0
-            path_msg.poses.append(pose)
-
-        self.path_pub.publish(path_msg)
-        self.get_logger().info(f"Published path from {start} to {goal}")
+            self.get_logger().error(f"❗ Error processing task_done: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
-    node = BiddingNode('drone_3')  # Change for each drone
+    node = BiddingNode('drone_3')  # change drone_id for each drone
     rclpy.spin(node)
+    node.destroy_node()
     rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
-
