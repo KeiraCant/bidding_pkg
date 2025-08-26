@@ -4,11 +4,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String, Float32
 import json
 import math
-import ee
+import requests
 from datetime import datetime, timedelta
-
-# Initialize Earth Engine with your project
-ee.Initialize(project='wildfirethesis')
+import time
 
 class WindDataNode(Node):
     def __init__(self):
@@ -25,118 +23,187 @@ class WindDataNode(Node):
         # Publisher for wind direction (in degrees)
         self.wind_direction_pub = self.create_publisher(Float32, '/wind_direction', qos)
 
-        self.get_logger().info("🌪️ Wind Direction Node started, waiting for /fire_tasks...")
+        # Frost API configuration
+        self.frost_client_id = "274b14f2-3547-4403-935a-7fc46d15b0a4"  # Replace with your actual client ID
+        self.frost_base_url = "https://frost.met.no"
+        
+        # Cache for nearby stations to avoid repeated lookups
+        self.station_cache = {}
 
-    def get_latest_gfs_data(self):
-        """Get the most recent GFS forecast data available"""
+        self.get_logger().info("🌪️ Wind Direction Node started with Frost API, waiting for /fire_tasks...")
+
+    def find_nearby_stations(self, lat, lon, max_distance_km=50):
+        """Find weather stations near the given coordinates"""
+        cache_key = f"{lat:.2f},{lon:.2f}"
+        if cache_key in self.station_cache:
+            return self.station_cache[cache_key]
+        
         try:
-            # Get current date and go back a few days to ensure data availability
-            end_date = datetime.utcnow()
-            start_date = end_date - timedelta(days=3)
+            # Use sources endpoint to find stations (following official example pattern)
+            endpoint = f"{self.frost_base_url}/sources/v0.jsonld"
+            parameters = {
+                'country': 'NO',
+                'types': 'SensorSystem'
+            }
             
-            # Format dates for Earth Engine
-            start_str = start_date.strftime('%Y-%m-%d')
-            end_str = end_date.strftime('%Y-%m-%d')
+            # Make request using the exact pattern from the official example
+            r = requests.get(endpoint, parameters, auth=(self.frost_client_id, ''))
             
-            # Load GFS collection and get the most recent forecast
-            gfs_collection = ee.ImageCollection('NOAA/GFS0P25')
-            recent_forecasts = gfs_collection.filterDate(start_str, end_str).sort('system:time_start', False)
-            latest_forecast = recent_forecasts.first()
+            # Check if the request worked (following official example)
+            if r.status_code == 200:
+                json_data = r.json()
+                self.get_logger().info(f"✅ Data retrieved from frost.met.no!")
+            else:
+                json_data = r.json()
+                self.get_logger().error(f"❌ Error! Returned status code {r.status_code}")
+                if 'error' in json_data:
+                    self.get_logger().error(f"Message: {json_data['error'].get('message', 'Unknown')}")
+                    self.get_logger().error(f"Reason: {json_data['error'].get('reason', 'Unknown')}")
+                return []
             
-            if latest_forecast is None:
-                self.get_logger().error("No GFS forecast data found in recent days")
-                return None
+            data = json_data.get('data', [])
+            stations = []
+            
+            for source in data:
+                source_id = source.get('id', '')
+                name = source.get('name', 'Unknown')
                 
-            forecast_time = ee.Date(latest_forecast.get('system:time_start'))
-            forecast_time_str = forecast_time.format('YYYY-MM-dd HH:mm:ss').getInfo()
-            self.get_logger().info(f"🌪️ Using GFS forecast from: {forecast_time_str}")
+                # Extract coordinates if available
+                geometry = source.get('geometry')
+                if geometry and geometry.get('coordinates'):
+                    coords = geometry['coordinates']
+                    station_lon, station_lat = coords[0], coords[1]
+                    
+                    # Calculate approximate distance
+                    distance = self.calculate_distance(lat, lon, station_lat, station_lon)
+                    
+                    if distance <= max_distance_km:
+                        stations.append({
+                            'id': source_id,
+                            'name': name,
+                            'lat': station_lat,
+                            'lon': station_lon,
+                            'distance': distance
+                        })
             
-            return latest_forecast
+            # Sort by distance and limit to reasonable number
+            stations.sort(key=lambda x: x['distance'])
+            stations = stations[:10]  # Take only 10 closest
+            
+            # Cache result
+            self.station_cache[cache_key] = stations
+            
+            self.get_logger().info(f"🗺️ Found {len(stations)} stations within {max_distance_km}km of ({lat:.4f}, {lon:.4f})")
+            for station in stations[:3]:  # Log first 3
+                self.get_logger().info(f"   📍 {station['name']} ({station['id']}) - {station['distance']:.1f}km")
+            
+            return stations
             
         except Exception as e:
-            self.get_logger().error(f"❌ Error getting GFS data: {e}")
+            self.get_logger().error(f"❌ Error finding nearby stations: {e}")
+            return []
+
+    def get_wind_data_from_station(self, station_id, hours_back=24):
+        """Get recent wind data from a specific station"""
+        try:
+            # Get time range (last N hours)
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(hours=hours_back)
+            
+            # Format times for Frost API (following official example)
+            start_str = start_time.strftime('%Y-%m-%d')
+            end_str = end_time.strftime('%Y-%m-%d')
+            
+            # Use observations endpoint (following official example pattern)
+            endpoint = f"{self.frost_base_url}/observations/v0.jsonld"
+            parameters = {
+                'sources': station_id,
+                'referencetime': f'{start_str}/{end_str}',
+                'elements': 'wind_speed,wind_from_direction'
+            }
+            
+            # Issue an HTTP GET request (exact pattern from official example)
+            r = requests.get(endpoint, parameters, auth=(self.frost_client_id, ''))
+            
+            # Check if the request worked (following official example)
+            if r.status_code == 200:
+                json_data = r.json()
+                data = json_data.get('data', [])
+                self.get_logger().info(f"✅ Got {len(data)} observations from {station_id}")
+            else:
+                json_data = r.json()
+                self.get_logger().error(f"❌ Error for station {station_id}! Status code {r.status_code}")
+                if 'error' in json_data:
+                    self.get_logger().error(f"Message: {json_data['error'].get('message', 'Unknown')}")
+                return None
+            
+            if not data:
+                return None
+            
+            # Extract most recent wind data (following data structure from official example)
+            latest_wind_direction = None
+            latest_wind_speed = None
+            latest_time = None
+            
+            for obs in data:
+                obs_time = obs.get('referenceTime')
+                for observation in obs.get('observations', []):
+                    element_id = observation.get('elementId')
+                    value = observation.get('value')
+                    
+                    if element_id == 'wind_from_direction' and value is not None:
+                        if latest_time is None or obs_time > latest_time:
+                            latest_wind_direction = float(value)
+                            latest_time = obs_time
+                    elif element_id == 'wind_speed' and value is not None:
+                        latest_wind_speed = float(value)
+            
+            if latest_wind_direction is not None:
+                self.get_logger().info(f"🌪️ Station {station_id}: Wind direction {latest_wind_direction}° at {latest_time}")
+                if latest_wind_speed is not None:
+                    self.get_logger().info(f"💨 Wind speed: {latest_wind_speed} m/s")
+                return latest_wind_direction
+            
+            return None
+            
+        except Exception as e:
+            self.get_logger().error(f"❌ Error getting wind data from station {station_id}: {e}")
             return None
 
-    def query_wind_data_grid(self, fire_lat, fire_lon):
-        """Query wind data around the fire location to calculate wind direction"""
+    def get_wind_direction_for_location(self, lat, lon):
+        """Get wind direction for a specific location using nearby stations"""
         try:
-            # Get the latest GFS forecast
-            gfs_image = self.get_latest_gfs_data()
-            if gfs_image is None:
+            # Find nearby stations
+            stations = self.find_nearby_stations(lat, lon)
+            if not stations:
+                self.get_logger().warning(f"⚠️ No weather stations found near ({lat:.6f}, {lon:.6f})")
                 return None
-
-            # Create a region around the fire location
-            half_box_degrees = 0.15  # ~16.7km radius
-            region = ee.Geometry.Rectangle([
-                fire_lon - half_box_degrees,
-                fire_lat - half_box_degrees,
-                fire_lon + half_box_degrees,
-                fire_lat + half_box_degrees
-            ])
-
-            # Select wind components
-            wind_bands = gfs_image.select([
-                'u_component_of_wind_10m_above_ground',
-                'v_component_of_wind_10m_above_ground'
-            ])
-
-            # Sample wind data
-            sampled = wind_bands.sample(
-                region=region,
-                scale=28000,  # GFS resolution (~28km)
-                geometries=True,
-                numPixels=25,  # 5x5 grid
-                seed=42
-            )
             
-            features = sampled.getInfo()['features']
-            if not features:
-                self.get_logger().warning(f"⚠️ No wind data found around ({fire_lat:.6f}, {fire_lon:.6f})")
-                return None
-
-            wind_directions = []
-            for f in features:
-                try:
-                    props = f['properties']
-                    u_wind = props.get('u_component_of_wind_10m_above_ground', 0)
-                    v_wind = props.get('v_component_of_wind_10m_above_ground', 0)
-                    
-                    if u_wind is None or v_wind is None:
-                        continue
-                    
-                    # Calculate wind direction (meteorological convention: direction wind is coming FROM)
-                    wind_direction_rad = math.atan2(-u_wind, -v_wind)
-                    wind_direction_deg = (wind_direction_rad * 180 / math.pi) % 360
-                    wind_directions.append(wind_direction_deg)
-                    
-                except Exception as e:
-                    self.get_logger().warning(f"⚠️ Error processing wind sample: {e}")
-                    continue
-
-            if not wind_directions:
-                self.get_logger().warning(f"❌ No valid wind direction data for ({fire_lat:.6f}, {fire_lon:.6f})")
-                return None
-
-            # Calculate average wind direction
-            avg_direction = self.calculate_average_wind_direction(wind_directions)
-            self.get_logger().info(f"🌪️ Average wind direction: {avg_direction:.1f}°")
-            return avg_direction
-
+            # Try to get data from stations, starting with the closest
+            for station in stations:
+                wind_direction = self.get_wind_data_from_station(station['id'])
+                if wind_direction is not None:
+                    self.get_logger().info(f"✅ Got wind data from {station['name']} ({station['distance']:.1f}km away)")
+                    return wind_direction
+                else:
+                    self.get_logger().info(f"⚠️ No recent wind data from {station['name']}")
+            
+            # If no data from any station
+            self.get_logger().warning(f"❌ No recent wind data available from any nearby stations")
+            return None
+            
         except Exception as e:
-            self.get_logger().error(f"❌ Earth Engine wind query failed: {e}")
+            self.get_logger().error(f"❌ Error getting wind direction: {e}")
             return None
 
-    def calculate_average_wind_direction(self, wind_directions):
-        """Calculate vector average of wind directions"""
-        try:
-            sum_x = sum(math.cos(math.radians(deg)) for deg in wind_directions)
-            sum_y = sum(math.sin(math.radians(deg)) for deg in wind_directions)
-            avg_direction_rad = math.atan2(sum_y, sum_x)
-            avg_direction_deg = (avg_direction_rad * 180 / math.pi) % 360
-            return avg_direction_deg
-        except Exception as e:
-            self.get_logger().error(f"❌ Error calculating average wind direction: {e}")
-            return 0.0
+    def calculate_distance(self, lat1, lon1, lat2, lon2):
+        """Calculate approximate distance between two points in km"""
+        # Simplified distance calculation (good enough for finding nearby stations)
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        # Rough conversion: 1 degree ≈ 111 km
+        distance = math.sqrt(dlat**2 + dlon**2) * 111
+        return distance
 
     def fire_task_callback(self, msg):
         try:
@@ -155,11 +222,13 @@ class WindDataNode(Node):
 
             self.get_logger().info(f"🌪️ Processing wind direction for {task_id} at ({fire_lat:.6f}, {fire_lon:.6f})")
 
-            avg_wind_direction = self.query_wind_data_grid(fire_lat, fire_lon)
-            if avg_wind_direction is not None:
+            wind_direction = self.get_wind_direction_for_location(fire_lat, fire_lon)
+            if wind_direction is not None:
                 # Publish wind direction
-                self.wind_direction_pub.publish(Float32(data=avg_wind_direction))
-                self.get_logger().info(f"✅ Published wind direction for {task_id}: {avg_wind_direction:.1f}°")
+                self.wind_direction_pub.publish(Float32(data=wind_direction))
+                self.get_logger().info(f"✅ Published wind direction for {task_id}: {wind_direction:.1f}°")
+            else:
+                self.get_logger().warning(f"⚠️ Could not get wind direction for {task_id}")
 
         except Exception as e:
             self.get_logger().error(f"❌ Error processing fire task: {e}")

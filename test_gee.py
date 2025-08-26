@@ -83,12 +83,15 @@ class FireDataNode(Node):
         else:
             self.modis_veg_img = modis_img.select('LC_Type1')
 
-        # CSV file for raw fire data
+        # CSV file for raw fire data - CREATE NEW FILE EACH TIME NODE STARTS
         self.raw_csv_path = os.path.expanduser('~/fire_data_raw.csv')
-        if not os.path.exists(self.raw_csv_path):
-            with open(self.raw_csv_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['task_id','lat','lon','class_code','class_name','class_pct_coverage'])
+        
+        # Always create a fresh CSV file with headers (overwrites existing file)
+        with open(self.raw_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['task_id','lat','lon','class_code','class_name','class_pct_coverage'])
+        
+        self.get_logger().info(f"📄 Created fresh CSV file: {self.raw_csv_path}")
 
     def query_ee_grid_50m(self, fire_lat, fire_lon):
         try:
@@ -182,7 +185,7 @@ class FireDataNode(Node):
             self.fire_priority_pub.publish(String(data=json.dumps(priority_msg)))
             self.get_logger().info(f"📊 Priority for {task_id}: {priority:.3f}")
 
-            # --- NEW: write raw data to CSV ---
+            # Write raw data to CSV (append mode since we created fresh file at startup)
             try:
                 with open(self.raw_csv_path, 'a', newline='') as f:
                     writer = csv.writer(f)
