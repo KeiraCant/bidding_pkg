@@ -21,7 +21,7 @@ class FireTaskPublisher(Node):
             #{'location': [63.4195320, 10.4019966]},
             #{'location': [63.4174508, 10.4037534]},
             #{'location': [63.4144163, 10.4015530]},
-            {'location': [63.4296754, 10.3975590]},
+            #{'location': [63.4296754, 10.3975590]},
             #{'location': [63.4192631, 10.4032286]},
             #{'location': [63.4415407, 10.4152022]},
             #{'location': [63.4000059, 10.3790786]},
@@ -30,7 +30,7 @@ class FireTaskPublisher(Node):
         ]
         
         # Timer to publish fires every 30 seconds
-        self.fire_timer = self.create_timer(60.0, self.publish_fire_task)
+        self.fire_timer = self.create_timer(30.0, self.publish_fire_task)
         
         self.get_logger().info("🔥 Fire Task Publisher started")
 

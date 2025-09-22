@@ -65,9 +65,9 @@ class DroneController(Node):
         # Initialize service clients
         self.init_service_clients()
 
-        self.get_logger().info(f"✅ {drone_id} Multi-Fire Drone Controller started")
-        self.get_logger().info(f"🔗 Waiting for path from planner on /fire_planner_path_{drone_id}")
-        self.get_logger().info(f"📡 Will upload FIRE PLANNER waypoints as mission to autopilot")
+        self.get_logger().info(f" {drone_id} Multi-Fire Drone Controller started")
+        self.get_logger().info(f" Waiting for path from planner on /fire_planner_path_{drone_id}")
+        self.get_logger().info(f" Will upload FIRE PLANNER waypoints as mission to autopilot")
 
     def init_service_clients(self):
         """Initialize all service clients"""
@@ -81,7 +81,7 @@ class DroneController(Node):
         if msg.status.status >= 0:  # valid fix
             self.current_gps = msg
             if not self.got_initial_gps:
-                self.get_logger().info(f"📡 Initial GPS fix: {msg.latitude:.8f}, {msg.longitude:.8f}")
+                self.get_logger().info(f" Initial GPS fix: {msg.latitude:.8f}, {msg.longitude:.8f}")
                 self.got_initial_gps = True
 
     def assignment_callback(self, msg):
@@ -89,13 +89,13 @@ class DroneController(Node):
         if data['drone_id'] != self.drone_id:
             return
 
-        self.get_logger().info(f"📦 Assignment received: {data}")
+        self.get_logger().info(f" Assignment received: {data}")
         self.assignment = data
         self.task_simulation_start = None
 
         # If we already have a pending mission, upload it now
         if self.has_pending_mission and self.fire_planner_path:
-            self.get_logger().info(f"🚀 Assignment received, uploading pending mission with {len(self.fire_planner_path)} waypoints")
+            self.get_logger().info(f" Assignment received, uploading pending mission with {len(self.fire_planner_path)} waypoints")
             self.upload_fire_planner_path_async()
             self.has_pending_mission = False
 
@@ -143,7 +143,7 @@ class DroneController(Node):
     def save_mission_waypoints(self, filename=None):
         """Save mission in Mission Planner .waypoints format (QGC WPL 110)"""
         if not self.fire_planner_path:
-            self.get_logger().warn("⚠️ No path to save to Mission Planner file")
+            self.get_logger().warn(" No path to save to Mission Planner file")
             return
 
         if filename is None:
@@ -166,7 +166,7 @@ class DroneController(Node):
                     row = [i, current, frame, command, *params, autocontinue]
                     writer.writerow(row)
 
-            self.get_logger().info(f"💾 Saved Mission Planner waypoints → {filename}")
+            self.get_logger().info(f" Saved Mission Planner waypoints → {filename}")
 
         except Exception as e:
             self.get_logger().error(f"❌ Failed to save mission file: {e}")
@@ -197,7 +197,7 @@ class DroneController(Node):
             return
 
         # Clear old mission first
-        self.get_logger().info("🧹 Clearing old mission...")
+        self.get_logger().info(" Clearing old mission...")
         req_clear = WaypointClear.Request()
         future_clear = self.wp_clear_client.call_async(req_clear)
         future_clear.add_done_callback(self.on_clear_complete)
@@ -252,7 +252,7 @@ class DroneController(Node):
 
         # Push mission
         try:
-            self.get_logger().info(f"🚀 Uploading {len(waypoints)} waypoints to autopilot...")
+            self.get_logger().info(f"Uploading {len(waypoints)} waypoints to autopilot...")
             req = WaypointPush.Request()
             req.start_index = 0
             req.waypoints = waypoints
@@ -260,7 +260,7 @@ class DroneController(Node):
             # Log first few waypoints for debugging
             for i, wp in enumerate(req.waypoints[:3]):
                 self.get_logger().info(
-                    f"📤 WP {i}: lat={wp.x_lat:.8f}, lon={wp.y_long:.8f}, alt={wp.z_alt:.2f}, "
+                    f" WP {i}: lat={wp.x_lat:.8f}, lon={wp.y_long:.8f}, alt={wp.z_alt:.2f}, "
                     f"cmd={wp.command}, current={wp.is_current}"
                 )
 
@@ -292,7 +292,7 @@ class DroneController(Node):
         """Simulate task completion and handle pending missions"""
         # Handle pending mission uploads
         if self.has_pending_mission and self.fire_planner_path:
-            self.get_logger().info(f"🔄 Retrying pending mission upload...")
+            self.get_logger().info(f" Retrying pending mission upload...")
             self.upload_fire_planner_path_async()
             self.has_pending_mission = False
 
@@ -313,7 +313,7 @@ class DroneController(Node):
             else:
                 remaining = self.task_simulation_duration - elapsed
                 if int(remaining) != int(remaining + 1):  # Log every second
-                    self.get_logger().info(f"⏱️ Task progress: {remaining:.1f}s remaining")
+                    self.get_logger().info(f" Task progress: {remaining:.1f}s remaining")
 
     def publish_visited_fire_waypoint(self, waypoint):
         visited_data = {
@@ -322,7 +322,7 @@ class DroneController(Node):
         }
         json_msg = json.dumps(visited_data)
         self.visited_waypoints_pub.publish(String(data=json_msg))
-        self.get_logger().info(f"📤 ✅ Published visited FIRE waypoint: ({waypoint[0]:.6f}, {waypoint[1]:.6f}, {waypoint[2]})")
+        self.get_logger().info(f" ✅ Published visited FIRE waypoint: ({waypoint[0]:.6f}, {waypoint[1]:.6f}, {waypoint[2]})")
 
     # MAVROS Services - simplified and non-blocking
     def set_auto_mode(self):
@@ -337,7 +337,7 @@ class DroneController(Node):
         request = SetMode.Request()
         request.custom_mode = "AUTO"
         future = self.set_mode_client.call_async(request)
-        self.get_logger().info("🔁 Requested AUTO.MISSION mode")
+        self.get_logger().info(" Requested AUTO.MISSION mode")
 
     def arm_drone(self):
         if not self.arming_client:
@@ -352,7 +352,7 @@ class DroneController(Node):
         request.value = True
         future = self.arming_client.call_async(request)
         self.armed = True
-        self.get_logger().info("🔒 Requested drone arming")
+        self.get_logger().info(" Requested drone arming")
 
     def set_takeoff(self):
         if not self.takeoff_client:
@@ -366,7 +366,7 @@ class DroneController(Node):
         request = CommandTOL.Request()
         request.altitude = 50.0
         future = self.takeoff_client.call_async(request)
-        self.get_logger().info("🛫 Requested takeoff")
+        self.get_logger().info(" Requested takeoff")
 
 def main(args=None):
     rclpy.init(args=args)
@@ -378,7 +378,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        print(f"\n🛑 Shutting down {drone_id} controller...")
+        print(f"\n Shutting down {drone_id} controller...")
     finally:
         node.destroy_node()
         rclpy.shutdown()
