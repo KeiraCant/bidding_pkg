@@ -13,9 +13,10 @@ import csv
 from datetime import datetime
 
 class DroneController(Node):
-    def __init__(self, drone_id):
+    def __init__(self, drone_id, mode):
         super().__init__(f'{drone_id}_controller')
         self.drone_id = drone_id
+        self.mode = mode  # 'autonomous' or 'pilot'
     
         # Drone state
         self.current_gps = None
@@ -26,8 +27,6 @@ class DroneController(Node):
         # Path state - fire planner waypoints
         self.fire_planner_path = []  
         self.has_pending_mission = False  # Track if we have a mission waiting to upload
-
-        
 
         # Service clients - create once and reuse
         self.wp_push_client = None
@@ -65,17 +64,24 @@ class DroneController(Node):
         # Initialize service clients
         self.init_service_clients()
 
-        self.get_logger().info(f" {drone_id} Multi-Fire Drone Controller started")
+        mode_str = "AUTONOMOUS" if self.mode == 'autonomous' else "PILOT IN THE LOOP"
+        self.get_logger().info(f" {drone_id} Multi-Fire Drone Controller started in {mode_str} mode")
         self.get_logger().info(f" Waiting for path from planner on /fire_planner_path_{drone_id}")
-        self.get_logger().info(f" Will upload FIRE PLANNER waypoints as mission to autopilot")
+        if self.mode == 'autonomous':
+            self.get_logger().info(f" Will upload waypoints and AUTO-ARM/TAKEOFF")
+        else:
+            self.get_logger().info(f" Will upload waypoints ONLY (pilot controls arm/takeoff/mode)")
 
     def init_service_clients(self):
         """Initialize all service clients"""
         self.wp_push_client = self.create_client(WaypointPush, f'/{self.drone_id}/mavros/mission/push')
         self.wp_clear_client = self.create_client(WaypointClear, f'/{self.drone_id}/mavros/mission/clear')
-        self.set_mode_client = self.create_client(SetMode, f'/{self.drone_id}/mavros/set_mode')
-        self.arming_client = self.create_client(CommandBool, f'/{self.drone_id}/mavros/cmd/arming')
-        self.takeoff_client = self.create_client(CommandTOL, f'/{self.drone_id}/mavros/cmd/takeoff')
+        
+        # Only create these clients in autonomous mode
+        if self.mode == 'autonomous':
+            self.set_mode_client = self.create_client(SetMode, f'/{self.drone_id}/mavros/set_mode')
+            self.arming_client = self.create_client(CommandBool, f'/{self.drone_id}/mavros/cmd/arming')
+            self.takeoff_client = self.create_client(CommandTOL, f'/{self.drone_id}/mavros/cmd/takeoff')
 
     def gps_callback(self, msg: NavSatFix):
         if msg.status.status >= 0:  # valid fix
@@ -99,9 +105,13 @@ class DroneController(Node):
             self.upload_fire_planner_path_async()
             self.has_pending_mission = False
 
-        self.set_auto_mode()
-        self.arm_drone()
-        self.set_takeoff()
+        # Only do autonomous actions in autonomous mode
+        if self.mode == 'autonomous':
+            self.set_auto_mode()
+            self.arm_drone()
+            self.set_takeoff()
+        else:
+            self.get_logger().info(f" PILOT MODE: Waypoints uploaded. Pilot must manually arm/takeoff/set mode")
 
     def task_done_callback(self, msg):
         try:
@@ -109,7 +119,7 @@ class DroneController(Node):
             if (data['drone_id'] == self.drone_id and
                 self.assignment and
                 data['task_id'] == self.assignment['task_id']):
-                self.get_logger().info(f"🔥 Task {data['task_id']} complete")
+                self.get_logger().info(f" Task {data['task_id']} complete")
                 # DON'T clear assignment immediately - let the planner send new path first
         except Exception as e:
             self.get_logger().error(f"Error in task_done_callback: {e}")
@@ -127,7 +137,7 @@ class DroneController(Node):
             ]
 
             if self.fire_planner_path:
-                self.get_logger().info(f"📍 Received FIRE PLANNER path with {len(self.fire_planner_path)} GPS waypoints")
+                self.get_logger().info(f"Received FIRE PLANNER path with {len(self.fire_planner_path)} GPS waypoints")
                 
                 # Always try to upload immediately, regardless of assignment status
                 self.upload_fire_planner_path_async()
@@ -143,7 +153,7 @@ class DroneController(Node):
     def save_mission_waypoints(self, filename=None):
         """Save mission in Mission Planner .waypoints format (QGC WPL 110)"""
         if not self.fire_planner_path:
-            self.get_logger().warn(" No path to save to Mission Planner file")
+            self.get_logger().warn("⚠️ No path to save to Mission Planner file")
             return
 
         if filename is None:
@@ -184,7 +194,7 @@ class DroneController(Node):
             return
 
         # Wait for services with shorter timeout
-        self.get_logger().info("🌀 Checking service availability...")
+        self.get_logger().info(" Checking service availability...")
         
         if not self.wp_clear_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().warn("⚠️ WaypointClear service not ready, marking as pending")
@@ -252,7 +262,7 @@ class DroneController(Node):
 
         # Push mission
         try:
-            self.get_logger().info(f"Uploading {len(waypoints)} waypoints to autopilot...")
+            self.get_logger().info(f" Uploading {len(waypoints)} waypoints to autopilot...")
             req = WaypointPush.Request()
             req.start_index = 0
             req.waypoints = waypoints
@@ -260,7 +270,7 @@ class DroneController(Node):
             # Log first few waypoints for debugging
             for i, wp in enumerate(req.waypoints[:3]):
                 self.get_logger().info(
-                    f" WP {i}: lat={wp.x_lat:.8f}, lon={wp.y_long:.8f}, alt={wp.z_alt:.2f}, "
+                    f"  WP {i}: lat={wp.x_lat:.8f}, lon={wp.y_long:.8f}, alt={wp.z_alt:.2f}, "
                     f"cmd={wp.command}, current={wp.is_current}"
                 )
 
@@ -276,11 +286,10 @@ class DroneController(Node):
             result = future.result()
             if result and getattr(result, "success", False):
                 count = getattr(result, "wp_transfered", len(self.fire_planner_path))
-                self.get_logger().info(f"✅ Mission uploaded successfully! {count} waypoints transferred")
+                self.get_logger().info(f"Mission uploaded successfully! {count} waypoints transferred")
                 
-                
-                    
-              
+                if self.mode == 'pilot':
+                    self.get_logger().info(f" PILOT MODE: Mission ready. Pilot can now arm and takeoff")
                     
             else:
                 error_msg = getattr(result, 'error_msg', 'Unknown error') if result else 'No result'
@@ -292,11 +301,15 @@ class DroneController(Node):
         """Simulate task completion and handle pending missions"""
         # Handle pending mission uploads
         if self.has_pending_mission and self.fire_planner_path:
-            self.get_logger().info(f" Retrying pending mission upload...")
+            self.get_logger().info(f"Retrying pending mission upload...")
             self.upload_fire_planner_path_async()
             self.has_pending_mission = False
 
-        if not self.assignment or not self.current_gps or not self.armed:
+        if not self.assignment or not self.current_gps:
+            return
+        
+        # Only check armed status in autonomous mode
+        if self.mode == 'autonomous' and not self.armed:
             return
 
         current_time = time.time()
@@ -306,7 +319,7 @@ class DroneController(Node):
             if elapsed >= self.task_simulation_duration:
                 done_msg = {"task_id": self.assignment['task_id'], "drone_id": self.drone_id}
                 self.done_pub.publish(String(data=json.dumps(done_msg)))
-                self.get_logger().info(f"✅ Task completed: {self.assignment['task_id']}")
+                self.get_logger().info(f" Task completed: {self.assignment['task_id']}")
                 # Clear assignment after publishing completion
                 self.assignment = None
                 self.task_simulation_start = None
@@ -322,16 +335,19 @@ class DroneController(Node):
         }
         json_msg = json.dumps(visited_data)
         self.visited_waypoints_pub.publish(String(data=json_msg))
-        self.get_logger().info(f" ✅ Published visited FIRE waypoint: ({waypoint[0]:.6f}, {waypoint[1]:.6f}, {waypoint[2]})")
+        self.get_logger().info(f" Published visited FIRE waypoint: ({waypoint[0]:.6f}, {waypoint[1]:.6f}, {waypoint[2]})")
 
-    # MAVROS Services - simplified and non-blocking
+    # MAVROS Services - simplified and non-blocking (only used in autonomous mode)
     def set_auto_mode(self):
+        if self.mode != 'autonomous':
+            return
+            
         if not self.set_mode_client:
             self.get_logger().error("❌ Set mode client not initialized")
             return
             
         if not self.set_mode_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn("⚠️ Set mode service not available")
+            self.get_logger().warn(" Set mode service not available")
             return
             
         request = SetMode.Request()
@@ -340,27 +356,33 @@ class DroneController(Node):
         self.get_logger().info(" Requested AUTO.MISSION mode")
 
     def arm_drone(self):
+        if self.mode != 'autonomous':
+            return
+            
         if not self.arming_client:
             self.get_logger().error("❌ Arming client not initialized")
             return
             
         if not self.arming_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn("⚠️ Arming service not available")
+            self.get_logger().warn(" Arming service not available")
             return
             
         request = CommandBool.Request()
         request.value = True
         future = self.arming_client.call_async(request)
         self.armed = True
-        self.get_logger().info(" Requested drone arming")
+        self.get_logger().info("Requested drone arming")
 
     def set_takeoff(self):
+        if self.mode != 'autonomous':
+            return
+            
         if not self.takeoff_client:
-            self.get_logger().error("❌ Takeoff client not initialized")
+            self.get_logger().error(" Takeoff client not initialized")
             return
             
         if not self.takeoff_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn("⚠️ Takeoff service not available")
+            self.get_logger().warn(" Takeoff service not available")
             return
             
         request = CommandTOL.Request()
@@ -370,11 +392,51 @@ class DroneController(Node):
 
 def main(args=None):
     rclpy.init(args=args)
+    
     if len(sys.argv) < 2:
-        print("Usage: python drone_controller.py <drone_id>")
+        print("Usage: python drone_controller.py <drone_id> [mode]")
+        print("  mode: 'autonomous' (default) or 'pilot'")
         sys.exit(1)
+    
     drone_id = sys.argv[1]
-    node = DroneController(drone_id)
+    
+    # Get mode from command line or prompt user
+    if len(sys.argv) >= 3:
+        mode = sys.argv[2].lower()
+        if mode not in ['autonomous', 'pilot']:
+            print(f"Invalid mode: {mode}")
+            print("Mode must be 'autonomous' or 'pilot'")
+            sys.exit(1)
+    else:
+        print("\n" + "="*50)
+        print(" DRONE CONTROLLER MODE SELECTION")
+        print("="*50)
+        print("1. Autonomous Mode (default)")
+        print("   - Waypoints uploaded automatically")
+        print("   - Drone arms and takes off automatically")
+        print("   - Sets AUTO/GUIDED mode automatically")
+        print()
+        print("2. Pilot in the Loop Mode")
+        print("   - Waypoints uploaded to autopilot")
+        print("   - Pilot manually arms drone")
+        print("   - Pilot manually initiates takeoff")
+        print("   - Pilot manually sets flight mode")
+        print("="*50)
+        
+        while True:
+            choice = input("\nSelect mode (1 for autonomous, 2 for pilot) [1]: ").strip()
+            if choice == '' or choice == '1':
+                mode = 'autonomous'
+                break
+            elif choice == '2':
+                mode = 'pilot'
+                break
+            else:
+                print("Invalid choice. Please enter 1 or 2.")
+    
+    print(f"\n Starting {drone_id} in {mode.upper()} mode...\n")
+    
+    node = DroneController(drone_id, mode)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

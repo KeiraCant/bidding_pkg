@@ -17,8 +17,8 @@ class FireTaskPublisher(Node):
         
         # Predefined fires with lat, lon only
         self.predefined_fires = [
-            {'location': [63.4215217, 10.3997097]},
-            #{'location': [63.4195320, 10.4019966]},
+            #{'location': [63.4215217, 10.3997097]},
+            {'location': [63.4195320, 10.4019966]},
             #{'location': [63.4174508, 10.4037534]},
             #{'location': [63.4144163, 10.4015530]},
             #{'location': [63.4296754, 10.3975590]},

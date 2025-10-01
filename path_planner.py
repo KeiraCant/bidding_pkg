@@ -33,6 +33,15 @@ class MultiWaypointPlanner:
         self.nearby_radius = nearby_radius
         self.downstream_angle_range = downstream_angle_range
         self.priority_boost = priority_boost
+        self.algorithm = "multi_waypoint"
+
+    def set_algorithm(self, algorithm):
+        """Set the path planning algorithm to use"""
+        valid_algorithms = ["multi_waypoint", "sector_based", "dynamic_clustering", "priority_sweep"]
+        if algorithm in valid_algorithms:
+            self.algorithm = algorithm
+            return True
+        return False
 
     def distance_lat_lon(self, pos1, pos2):
         lat1, lon1 = pos1[:2]
@@ -58,7 +67,19 @@ class MultiWaypointPlanner:
             return min_angle <= bearing <= max_angle
         return bearing >= min_angle or bearing <= max_angle
     
-
+    def plan_path(self, start_pos, tasks, node=None):
+        """Route to the selected algorithm"""
+        if self.algorithm == "multi_waypoint":
+            return self.plan_multi_waypoint_path(start_pos, tasks, node)
+        elif self.algorithm == "sector_based":
+            return self.plan_sector_based_path(start_pos, tasks, node)
+        elif self.algorithm == "dynamic_clustering":
+            return self.plan_dynamic_clustering_path(start_pos, tasks, node)
+        elif self.algorithm == "priority_sweep":
+            return self.plan_priority_sweep_path(start_pos, tasks, node)
+        else:
+            return self.plan_multi_waypoint_path(start_pos, tasks, node)
+        
     def plan_sector_based_path(self, start_pos, tasks, node=None):
         """Divide area into sectors and process by priority within each sector"""
         if not tasks:
@@ -125,9 +146,9 @@ class MultiWaypointPlanner:
                 )
     
         return path, task_order
+  
 
-
-    #def plan_dynamic_clustering_path(self, start_pos, tasks, node=None):
+    def plan_dynamic_clustering_path(self, start_pos, tasks, node=None):
         """Dynamic clustering with priority-weighted centroids"""
         if not tasks:
             return [], []
@@ -317,7 +338,7 @@ class MultiWaypointPlanner:
         
         return path, best_sequence
 
-    #def plan_priority_sweep_path(self, start_pos, tasks, node=None):
+    def plan_priority_sweep_path(self, start_pos, tasks, node=None):
         """Priority-first sweep with spatial optimization within tiers"""
         if not tasks:
             return [], []
@@ -358,7 +379,7 @@ class MultiWaypointPlanner:
                     node.get_logger().info(f"  Selected {tier_name} task {nearest_task[1]}: priority {nearest_task[0]:.2f}")
         
         return path, task_order
-    #def plan_multi_waypoint_path(self, start_pos, tasks, node=None):
+    def plan_multi_waypoint_path(self, start_pos, tasks, node=None):
         if not tasks:
             return [], []
 
@@ -405,9 +426,56 @@ class MultiWaypointPlanner:
                 )
 
         return path, task_order
+    
+def select_algorithm():
+    """Display menu and get user's algorithm choice"""
+    print("\n" + "="*70)
+    print("  FIRE RESPONSE PATH PLANNING - ALGORITHM SELECTION")
+    print("="*70)
+    print("\nAvailable path planning algorithms:\n")
+    
+    print("1. MULTI-WAYPOINT PLANNING (Default)")
+    print("   Balanced scoring approach that weighs both task priority (70%)")
+    print("   and travel distance (30%). Includes detour logic to handle")
+    print("   high-priority tasks efficiently. Best general-purpose algorithm.\n")
+    
+    print("2. SECTOR-BASED PLANNING")
+    print("   Divides the area into quadrants (NE, NW, SE, SW) and processes")
+    print("   the highest priority task in the nearest sector. Good for large")
+    print("   dispersed areas with clear spatial patterns.\n")
+    
+    print("3. DYNAMIC CLUSTERING")
+    print("   Groups nearby tasks into adaptive clusters and processes by")
+    print("   priority within each cluster. Efficient for dense task regions")
+    print("   with varying priorities.\n")
+    
+    print("4. PRIORITY SWEEP")
+    print("   Divides tasks into HIGH/MEDIUM/LOW priority tiers and processes")
+    print("   each tier using nearest-neighbor. Ensures critical tasks are")
+    print("   handled first while minimising travel within tiers.\n")
+    
+    print("="*70)
+    
+    while True:
+        try:
+            choice = input("\nSelect algorithm (1-4, or press Enter for default): ").strip()
+            
+            if choice == "" or choice == "1":
+                return "multi_waypoint"
+            elif choice == "2":
+                return "sector_based"
+            elif choice == "3":
+                return "dynamic_clustering"
+            elif choice == "4":
+                return "priority_sweep"
+            else:
+                print("Invalid choice. Please enter 1-4 or press Enter for default.")
+        except KeyboardInterrupt:
+            print("\n\nExiting...")
+            sys.exit(0)
 
 class FireDataPlanner(Node):
-    def __init__(self, drone_id):
+    def __init__(self, drone_id, algorithm='multi_waypoint'):
         super().__init__(f'fire_planner_{drone_id}')
         self.drone_id = drone_id
 
@@ -475,7 +543,9 @@ class FireDataPlanner(Node):
         self.path_published = False
         self.planner = MultiWaypointPlanner(detour_threshold, nearby_radius, downstream_angle_range, priority_boost)
         self.fire_precip_sub = self.create_subscription(String, '/fire_precip', self.fire_precip_callback, qos)
-
+        self.planner = MultiWaypointPlanner(detour_threshold, nearby_radius, downstream_angle_range, priority_boost)
+        self.planner.set_algorithm(algorithm)
+        self.get_logger().info(f"Using algorithm: {algorithm.upper().replace('_', ' ')}")
         self.get_logger().info(f" Multi-Fire Data Planner initialized for {drone_id}")
         # MAVROS mission tracking
         self.total_wp = None
@@ -497,6 +567,20 @@ class FireDataPlanner(Node):
         # Keep track of mission state
         self.mavros_total_waypoints = 0
         self.mavros_last_reached = -1
+
+    def create_progress_bar(self, current, total, bar_length=30):
+        """Create a text-based progress bar"""
+        if total == 0:
+            return "[" + " " * bar_length + "] 0/0 (0%)"
+        
+        percent = current / total
+        filled_length = int(bar_length * percent)
+        bar = "=" * filled_length + ">" + " " * (bar_length - filled_length - 1)
+        
+        if filled_length == bar_length:
+            bar = "=" * bar_length
+        
+        return f"[{bar}] {current}/{total} ({percent*100:.0f}%)"
 
     def update_mission_info(self):
         """Check how many waypoints are in current mission"""
@@ -828,9 +912,7 @@ class FireDataPlanner(Node):
 
         self.remove_visited_tasks()
         start_pos = (self.current_lat, self.current_lon, 50.0)
-        gps_path, task_order = self.planner.plan_sector_based_path(
-            start_pos, self.tasks_by_fire[current_task], self
-        )
+        gps_path, task_order = self.planner.plan_path(start_pos, self.tasks_by_fire[current_task], self)
         
         if gps_path and task_order:
             self.save_task_order_to_csv(current_task, task_order, gps_path, replan_reason)
@@ -879,7 +961,9 @@ class FireDataPlanner(Node):
             return
         
         wp_seq = msg.wp_seq
-        self.get_logger().info(f"✅ Reached waypoint {wp_seq}/{self.total_wp - 1}")
+        progress = self.create_progress_bar(wp_seq, self.total_wp - 1)
+        self.get_logger().info(f"Mission Progress: {progress}")
+        #self.get_logger().info(f"✅ Reached waypoint {wp_seq}/{self.total_wp - 1}")
         
         if wp_seq < len(self.last_published_path):
             lat, lon, alt = self.last_published_path[wp_seq]
@@ -907,15 +991,22 @@ def main(args=None):
     if len(sys.argv) < 2:
         print("Usage: python fire_planner.py <drone_id>")
         sys.exit(1)
+    
     drone_id = sys.argv[1]
-    node = FireDataPlanner(drone_id)
+    
+    # Let user select algorithm
+    algorithm = select_algorithm()
+    print(f"\nStarting planner with {algorithm.upper().replace('_', ' ')} algorithm...\n")
+    
+    node = FireDataPlanner(drone_id, algorithm)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info(" Multi-Fire Data Planner shutting down...")
+        node.get_logger().info("Multi-Fire Data Planner shutting down...")
     finally:
         node.destroy_node()
         rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
+
