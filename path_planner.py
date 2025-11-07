@@ -12,6 +12,9 @@ from datetime import datetime
 from mavros_msgs.srv import WaypointPull
 from mavros_msgs.msg import WaypointReached, WaypointList
 import numpy as np
+import threading
+import queue
+
 landcover_priority_map = {
     "Built-up": 100,
     "Tree cover": 80,
@@ -89,13 +92,11 @@ class MultiWaypointPlanner:
         current_pos = start_pos
         task_order = []
         
-        # Calculate bounds of all tasks
         lats = [t[2][0] for t in tasks]
         lons = [t[2][1] for t in tasks]
         min_lat, max_lat = min(lats), max(lats)
         min_lon, max_lon = min(lons), max(lons)
         
-        # Create 4 sectors (quadrants)
         mid_lat = (min_lat + max_lat) / 2
         mid_lon = (min_lon + max_lon) / 2
         
@@ -106,9 +107,7 @@ class MultiWaypointPlanner:
             'SW': [t for t in tasks if t[2][0] < mid_lat and t[2][1] < mid_lon]
         }
         
-        #Process sectors in order of distance from current position
         while any(sectors.values()):
-            # Find closest non-empty sector
             closest_sector = None
             min_sector_dist = float('inf')
             
@@ -116,7 +115,6 @@ class MultiWaypointPlanner:
                 if not sector_tasks:
                     continue
                 
-                # Calculate distance to sector center
                 sector_center = [
                     sum(t[2][0] for t in sector_tasks) / len(sector_tasks),
                     sum(t[2][1] for t in sector_tasks) / len(sector_tasks)
@@ -130,7 +128,6 @@ class MultiWaypointPlanner:
             if closest_sector is None:
                 break
                 
-            # Process highest priority task in closest sector
             sector_tasks = sectors[closest_sector]
             highest_priority_task = max(sector_tasks, key=lambda t: abs(t[0]))
             sectors[closest_sector].remove(highest_priority_task)
@@ -139,15 +136,14 @@ class MultiWaypointPlanner:
             task_order.append(highest_priority_task)
             current_pos = highest_priority_task[2]
             
-            if node:
-                node.get_logger().info(
-                    f"Selected task from {closest_sector} sector: {highest_priority_task[1]}, "
-                    f"priority {highest_priority_task[0]:.2f}"
-                )
+            #if node:
+             #   node.get_logger().info(
+              #      f"Selected task from {closest_sector} sector: {highest_priority_task[1]}, "
+               #     f"priority {highest_priority_task[0]:.2f}"
+                #)
     
         return path, task_order
   
-
     def plan_dynamic_clustering_path(self, start_pos, tasks, node=None):
         """Dynamic clustering with priority-weighted centroids"""
         if not tasks:
@@ -158,12 +154,10 @@ class MultiWaypointPlanner:
         task_order = []
         remaining = tasks[:]
         
-        # Adaptive cluster size based on task density
         cluster_size = max(3, min(8, len(tasks) // 4))
         
         while remaining:
             if len(remaining) <= cluster_size:
-                # Process remaining tasks by priority
                 remaining.sort(key=lambda t: abs(t[0]), reverse=True)
                 for task in remaining:
                     path.append(task[2])
@@ -172,171 +166,41 @@ class MultiWaypointPlanner:
                 remaining.clear()
                 continue
             
-            # Find nearest cluster of tasks
             distances = [(i, self.distance_lat_lon(current_pos, t[2])) for i, t in enumerate(remaining)]
             distances.sort(key=lambda x: x[1])
             
-            # Select cluster based on proximity and priority
-            cluster_candidates = distances[:cluster_size * 2]  # Consider more candidates
+            cluster_candidates = distances[:cluster_size * 2]
             cluster = []
             
             for idx, dist in cluster_candidates:
                 if len(cluster) >= cluster_size:
                     break
                 task = remaining[idx]
-                # Include high priority tasks even if slightly farther
                 if not cluster or abs(task[0]) > np.percentile([abs(t[0]) for t in remaining], 60):
                     cluster.append((idx, task))
             
-            # Fill cluster to minimum size with closest remaining tasks
             while len(cluster) < min(cluster_size, len(remaining)):
                 for idx, dist in distances:
                     if idx not in [c[0] for c in cluster]:
                         cluster.append((idx, remaining[idx]))
                         break
             
-            # Sort cluster by priority and process
             cluster.sort(key=lambda x: abs(x[1][0]), reverse=True)
             
             for idx, task in cluster:
-                if task in remaining:  # Check if still available
+                if task in remaining:
                     remaining.remove(task)
                     path.append(task[2])
                     task_order.append(task)
                     current_pos = task[2]
                     
-                    if node:
-                        node.get_logger().info(
-                            f"Cluster task: {task[1]}, priority {task[0]:.2f}, "
-                            f"distance {self.distance_lat_lon(path[-2], task[2])*111000:.2f}m"
-                        )
+                   # if node:
+                    #    node.get_logger().info(
+                     #       f"Cluster task: {task[1]}, priority {task[0]:.2f}, "
+                      #      f"distance {self.distance_lat_lon(path[-2], task[2])*111000:.2f}m"
+                       # )
         
         return path, task_order
-
-
-    #def plan_genetic_algorithm_path(self, start_pos, tasks, node=None):
-        """Genetic algorithm optimization for priority-distance trade-off"""
-        if not tasks:
-            return [], []
-        
-        if len(tasks) <= 3:
-            # For small task sets, use simple priority ordering
-            sorted_tasks = sorted(tasks, key=lambda t: abs(t[0]), reverse=True)
-            path = [start_pos] + [t[2] for t in sorted_tasks]
-            return path, sorted_tasks
-        
-        import random
-        
-        def calculate_fitness(task_sequence):
-            """Calculate fitness based on priority sum and total distance"""
-            if not task_sequence:
-                return 0
-            
-            total_priority = sum(abs(t[0]) for t in task_sequence)
-            
-            # Calculate total path distance
-            total_distance = 0
-            pos = start_pos
-            for task in task_sequence:
-                total_distance += self.distance_lat_lon(pos, task[2])
-                pos = task[2]
-            
-            # Normalize and combine (higher is better)
-            max_priority = sum(abs(t[0]) for t in tasks)
-            max_distance = sum(self.distance_lat_lon(start_pos, t[2]) for t in tasks)
-            
-            priority_score = (total_priority / max_priority) if max_priority > 0 else 0
-            distance_score = 1 - (total_distance / max_distance) if max_distance > 0 else 1
-            
-            return priority_score * 0.6 + distance_score * 0.4
-        
-        def crossover(parent1, parent2):
-            """Order crossover preserving sequence"""
-            if len(parent1) <= 2:
-                return parent1, parent2
-            
-            size = len(parent1)
-            start, end = sorted(random.sample(range(size), 2))
-            
-            child1 = [None] * size
-            child1[start:end] = parent1[start:end]
-            
-            remaining = [t for t in parent2 if t not in child1]
-            j = 0
-            for i in range(size):
-                if child1[i] is None:
-                    child1[i] = remaining[j]
-                    j += 1
-            
-            return child1
-        
-        def mutate(sequence):
-            """Swap two random tasks"""
-            if len(sequence) < 2:
-                return sequence
-            
-            sequence = sequence[:]
-            i, j = random.sample(range(len(sequence)), 2)
-            sequence[i], sequence[j] = sequence[j], sequence[i]
-            return sequence
-        
-        # Genetic algorithm parameters
-        population_size = min(20, len(tasks) * 2)
-        generations = min(50, len(tasks) * 5)
-        mutation_rate = 0.1
-        
-        # Initialize population with different strategies
-        population = []
-        
-        # Priority-first sequence
-        population.append(sorted(tasks, key=lambda t: abs(t[0]), reverse=True))
-        
-        # Distance-first sequence
-        distances = [(self.distance_lat_lon(start_pos, t[2]), t) for t in tasks]
-        population.append([t for _, t in sorted(distances)])
-        
-        # Random sequences
-        for _ in range(population_size - 2):
-            sequence = tasks[:]
-            random.shuffle(sequence)
-            population.append(sequence)
-        
-        # Evolution
-        for generation in range(generations):
-            # Evaluate fitness
-            fitness_scores = [(calculate_fitness(seq), seq) for seq in population]
-            fitness_scores.sort(reverse=True)
-            
-            # Select best half
-            elite_size = population_size // 2
-            elite = [seq for _, seq in fitness_scores[:elite_size]]
-            
-            # Generate new population
-            new_population = elite[:]
-            
-            while len(new_population) < population_size:
-                parent1 = random.choice(elite)
-                parent2 = random.choice(elite)
-                child = crossover(parent1, parent2)
-                
-                if random.random() < mutation_rate:
-                    child = mutate(child)
-                
-                new_population.append(child)
-            
-            population = new_population
-        
-        # Return best solution
-        final_fitness = [(calculate_fitness(seq), seq) for seq in population]
-        best_sequence = max(final_fitness)[1]
-        
-        path = [start_pos] + [t[2] for t in best_sequence]
-        
-        if node:
-            best_fitness = calculate_fitness(best_sequence)
-            node.get_logger().info(f"Genetic algorithm completed: fitness {best_fitness:.3f}")
-        
-        return path, best_sequence
 
     def plan_priority_sweep_path(self, start_pos, tasks, node=None):
         """Priority-first sweep with spatial optimization within tiers"""
@@ -347,19 +211,17 @@ class MultiWaypointPlanner:
         current_pos = start_pos
         task_order = []
         
-        # Group tasks by priority tiers
         priorities = [abs(task[0]) for task in tasks]
         if not priorities:
             return path, task_order
             
-        priority_threshold_high = np.percentile(priorities, 75)  # Top 25%
-        priority_threshold_medium = np.percentile(priorities, 40)  # Middle 35%
+        priority_threshold_high = np.percentile(priorities, 75)
+        priority_threshold_medium = np.percentile(priorities, 40)
         
         high_priority = [t for t in tasks if abs(t[0]) >= priority_threshold_high]
         medium_priority = [t for t in tasks if priority_threshold_medium <= abs(t[0]) < priority_threshold_high]
         low_priority = [t for t in tasks if abs(t[0]) < priority_threshold_medium]
         
-        # Process each tier with nearest neighbor within the tier
         for tier_name, tier in [("HIGH", high_priority), ("MEDIUM", medium_priority), ("LOW", low_priority)]:
             if not tier:
                 continue
@@ -375,10 +237,11 @@ class MultiWaypointPlanner:
                 task_order.append(nearest_task)
                 current_pos = nearest_task[2]
                 
-                if node:
-                    node.get_logger().info(f"  Selected {tier_name} task {nearest_task[1]}: priority {nearest_task[0]:.2f}")
+                #if node:
+                 #   node.get_logger().info(f"  Selected {tier_name} task {nearest_task[1]}: priority {nearest_task[0]:.2f}")
         
         return path, task_order
+
     def plan_multi_waypoint_path(self, start_pos, tasks, node=None):
         if not tasks:
             return [], []
@@ -419,46 +282,43 @@ class MultiWaypointPlanner:
             current_pos = next_waypoint
             task_order.append(next_task)
 
-            if node:
-                node.get_logger().info(
-                    f"Selected task {next_task[1]}: priority {next_task[0]:.2f}, "
-                    f"distance {best_dist*111000:.2f}m, coords ({next_waypoint[0]:.6f}, {next_waypoint[1]:.6f})"
-                )
+            #if node:
+             #   node.get_logger().info(
+               #     f"Selected task {next_task[1]}: priority {next_task[0]:.2f}, "
+              #      f"distance {best_dist*111000:.2f}m, coords ({next_waypoint[0]:.6f}, {next_waypoint[1]:.6f})"
+                #)
 
         return path, task_order
-    
+
 def select_algorithm():
-    """Display menu and get user's algorithm choice"""
+    """Display menu and get user's initial algorithm choice"""
     print("\n" + "="*70)
     print("  FIRE RESPONSE PATH PLANNING - ALGORITHM SELECTION")
     print("="*70)
+    print("\nNote: You will be prompted to change the algorithm if downstream tasks are detected.")
     print("\nAvailable path planning algorithms:\n")
     
     print("1. MULTI-WAYPOINT PLANNING (Default)")
     print("   Balanced scoring approach that weighs both task priority (70%)")
-    print("   and travel distance (30%). Includes detour logic to handle")
-    print("   high-priority tasks efficiently. Best general-purpose algorithm.\n")
+    print("   and travel distance (30%). Best general-purpose algorithm.\n")
     
     print("2. SECTOR-BASED PLANNING")
-    print("   Divides the area into quadrants (NE, NW, SE, SW) and processes")
-    print("   the highest priority task in the nearest sector. Good for large")
-    print("   dispersed areas with clear spatial patterns.\n")
+    print("   Divides the area into quadrants and processes the highest priority task.")
+    print("   Good for large dispersed areas.\n")
     
     print("3. DYNAMIC CLUSTERING")
-    print("   Groups nearby tasks into adaptive clusters and processes by")
-    print("   priority within each cluster. Efficient for dense task regions")
-    print("   with varying priorities.\n")
+    print("   Groups nearby tasks into clusters and processes by priority.")
+    print("   Efficient for dense task regions.\n")
     
     print("4. PRIORITY SWEEP")
-    print("   Divides tasks into HIGH/MEDIUM/LOW priority tiers and processes")
-    print("   each tier using nearest-neighbor. Ensures critical tasks are")
-    print("   handled first while minimising travel within tiers.\n")
+    print("   Processes tasks by priority tiers (HIGH/MEDIUM/LOW).")
+    print("   Recommended for critical downstream tasks.\n")
     
     print("="*70)
     
     while True:
         try:
-            choice = input("\nSelect algorithm (1-4, or press Enter for default): ").strip()
+            choice = input("\nSelect initial algorithm (1-4, or press Enter for default): ").strip()
             
             if choice == "" or choice == "1":
                 return "multi_waypoint"
@@ -486,7 +346,7 @@ class FireDataPlanner(Node):
         self.declare_parameter('detour_threshold', 25.0)
         self.declare_parameter('nearby_radius', 35.0)
         self.declare_parameter('wind_direction_threshold', 1.0)
-        self.declare_parameter('replan_throttle_seconds', 120.0)  # New: throttle replanning
+        self.declare_parameter('replan_throttle_seconds', 120.0)
 
         downstream_angle_range = self.get_parameter('downstream_angle_range').value
         priority_boost = self.get_parameter('priority_boost').value
@@ -503,19 +363,21 @@ class FireDataPlanner(Node):
             depth=10
         )
 
-        # State - FIXED: Support multiple fires
+        # State
         self.wind_direction = None
-        self.main_fire_locations = {}  # Dict: task_id -> (lat, lon)
+        self.main_fire_locations = {}
         self.current_lat = None
         self.current_lon = None
         self.got_initial_gps = False
         self.visited_waypoints = set()
         self.plan_counter = 0
-        self.tasks_by_fire = {}  # Dict: task_id -> list of (priority, sub_task_id, coords, landcover_data)
-        self.active_fire_queue = []  # Ordered list of fires to process
-        self.current_fire_index = 0  # Index in active_fire_queue
-        self.last_replan_time = 0.0  # Throttle replanning
-        self.precip_by_fire = {}  # Dict: task_id -> precip_mm (last 24h)
+        self.tasks_by_fire = {}
+        self.active_fire_queue = []
+        self.current_fire_index = 0
+        self.last_replan_time = 0.0
+        self.precip_by_fire = {}
+        self.prompted_for_downstream = False
+        self.downstream_task_counts = {}
 
         # CSV files
         self.downstream_csv_path = os.path.expanduser(f'~/downstream_fire_tasks_{drone_id}.csv')
@@ -527,10 +389,12 @@ class FireDataPlanner(Node):
         with open(self.task_order_csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['timestamp', 'plan_number', 'execution_order', 'drone_id', 'task_id', 'sub_task_id', 'lat', 'lon', 'alt', 'priority', 'distance_from_previous', 'cumulative_distance', 'replan_reason'])
+        
         self.simple_task_csv_path = os.path.expanduser(f'~/task_coords_priority_{drone_id}.csv')
         with open(self.simple_task_csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['lat', 'lon', 'alt', 'priority'])
+
         # Subscriptions
         self.gps_sub = self.create_subscription(NavSatFix, f'/{drone_id}/mavros/global_position/global', self.gps_callback, qos)
         self.fire_data_sub = self.create_subscription(String, '/fire_data', self.fire_data_callback, qos)
@@ -538,35 +402,145 @@ class FireDataPlanner(Node):
         self.fire_tasks_sub = self.create_subscription(String, '/fire_tasks', self.fire_tasks_callback, qos)
         self.visited_waypoints_sub = self.create_subscription(String, f'/visited_waypoints_{drone_id}', self.visited_waypoints_callback, qos)
         self.path_pub = self.create_publisher(String, f'/fire_planner_path_{drone_id}', qos)
+        # Logging to UI
+        self.log_pub = self.create_publisher(String, '/fire_planner_log', qos)
 
         self.last_published_path = []
         self.path_published = False
         self.planner = MultiWaypointPlanner(detour_threshold, nearby_radius, downstream_angle_range, priority_boost)
-        self.fire_precip_sub = self.create_subscription(String, '/fire_precip', self.fire_precip_callback, qos)
-        self.planner = MultiWaypointPlanner(detour_threshold, nearby_radius, downstream_angle_range, priority_boost)
         self.planner.set_algorithm(algorithm)
-        self.get_logger().info(f"Using algorithm: {algorithm.upper().replace('_', ' ')}")
-        self.get_logger().info(f" Multi-Fire Data Planner initialized for {drone_id}")
+        self.publish_log(f"Using algorithm: {algorithm.upper().replace('_', ' ')}")
+        self.get_logger().info(f"Multi-Fire Data Planner initialized for {drone_id}")
+
+        self.fire_precip_sub = self.create_subscription(String, '/fire_precip', self.fire_precip_callback, qos)
+        
         # MAVROS mission tracking
         self.total_wp = None
-
-        # Service client to get mission info
         self.pull_client = self.create_client(WaypointPull, f'/{drone_id}/mavros/mission/pull')
-
-        # Subscriber to mission reached topic
         self.sub_reached = self.create_subscription(
             WaypointReached,
             f'/{drone_id}/mavros/mission/reached',
             self.reached_callback,
             qos
         )
-
         self.timer = self.create_timer(2.0, self.update_mission_info)
-
-
-        # Keep track of mission state
         self.mavros_total_waypoints = 0
         self.mavros_last_reached = -1
+
+        # Input queue for non-blocking user input
+        self.input_queue = queue.Queue()
+        self.input_thread = None
+        
+    def publish_log(self, text):
+        """Publish log message to UI and console, tagged with drone ID"""
+        tagged_text = f"[{self.drone_id}] {text}"
+        msg = String()
+        msg.data = tagged_text
+        self.log_pub.publish(msg)
+        self.get_logger().info(tagged_text)
+
+    
+    def count_downstream_tasks(self):
+        """Count downstream tasks for each fire"""
+        self.downstream_task_counts.clear()
+        downwind_direction = (self.wind_direction + 180) % 360 if self.wind_direction is not None else None
+        
+        if not downwind_direction:
+            return False
+
+        has_downstream = False
+        for task_id, tasks in self.tasks_by_fire.items():
+            main_fire = self.main_fire_locations.get(task_id)
+            if not main_fire:
+                continue
+                
+            downstream_count = 0
+            for task_data in tasks:
+                coords = task_data[2]
+                bearing = self.planner.calculate_bearing(main_fire[0], main_fire[1], coords[0], coords[1])
+                if self.planner.is_downstream(bearing, downwind_direction):
+                    downstream_count += 1
+            
+            self.downstream_task_counts[task_id] = downstream_count
+            if downstream_count > 0:
+                has_downstream = True
+        
+        return has_downstream
+
+    def prompt_algorithm_change(self):
+        """Prompt user to change algorithm based on downstream tasks"""
+        if self.prompted_for_downstream or not self.count_downstream_tasks():
+            return
+
+        self.prompted_for_downstream = True
+        total_fires = len(self.tasks_by_fire)
+        total_downstream = sum(self.downstream_task_counts.values())
+        self.publish_log(f"[DOWNSTREAM] Total downstream tasks: {total_downstream}")
+        print("\n" + "="*70)
+        print("  DOWNSTREAM FIRE TASKS DETECTED")
+        print("="*70)
+        print(f"\nCurrent Fire Status:")
+        print(f"  Total active fires: {total_fires}")
+        print(f"  Total downstream tasks: {total_downstream}")
+        for task_id, count in self.downstream_task_counts.items():
+            print(f"    Fire {task_id}: {count} downstream tasks")
+        print(f"  Wind direction: {self.wind_direction:.1f}°")
+        print(f"\nCurrent algorithm: {self.planner.algorithm.upper().replace('_', ' ')}")
+        print("\nWould you like to change the path planning algorithm?")
+        print("Available algorithms:\n")
+        
+        print("1. MULTI-WAYPOINT PLANNING")
+        print("   Balanced scoring (70% priority, 30% distance). Best general-purpose algorithm.")
+        print("   Recommended for scenarios with many downstream tasks.\n")
+        
+        print("2. SECTOR-BASED PLANNING")
+        print("   Processes highest priority task in nearest quadrant. Good for dispersed areas.\n")
+        
+        print("3. DYNAMIC CLUSTERING")
+        print("   Groups tasks into clusters and processes by priority. Efficient for dense regions.\n")
+        
+        print("4. PRIORITY SWEEP")
+        print("   Processes tasks by priority tiers (HIGH/MEDIUM/LOW). Recommended for critical downstream tasks.\n")
+        
+        print("="*70)
+        
+        def get_user_input():
+            try:
+                choice = input("\nSelect algorithm (1-4, or press Enter to keep current): ").strip()
+                self.input_queue.put(choice)
+            except KeyboardInterrupt:
+                self.input_queue.put("exit")
+        
+        self.input_thread = threading.Thread(target=get_user_input)
+        self.input_thread.daemon = True
+        self.input_thread.start()
+
+    def process_algorithm_change(self):
+        """Process user input for algorithm change from input queue"""
+        try:
+            choice = self.input_queue.get_nowait()
+            if choice == "exit":
+                self.get_logger().info("User requested shutdown")
+                rclpy.shutdown()
+                return
+
+            algorithm_map = {
+                "1": "multi_waypoint",
+                "2": "sector_based",
+                "3": "dynamic_clustering",
+                "4": "priority_sweep",
+                "": self.planner.algorithm
+            }
+            
+            new_algorithm = algorithm_map.get(choice, self.planner.algorithm)
+            if new_algorithm != self.planner.algorithm:
+                self.planner.set_algorithm(new_algorithm)
+                self.get_logger().info(f"Algorithm changed to: {new_algorithm.upper().replace('_', ' ')}")
+                self.last_replan_time = self.get_clock().now().nanoseconds / 1e9
+                self.plan_and_publish_path(replan_reason="algorithm_change")
+        
+        except queue.Empty:
+            pass
 
     def create_progress_bar(self, current, total, bar_length=30):
         """Create a text-based progress bar"""
@@ -583,11 +557,12 @@ class FireDataPlanner(Node):
         return f"[{bar}] {current}/{total} ({percent*100:.0f}%)"
 
     def update_mission_info(self):
-        """Check how many waypoints are in current mission"""
+        """Check mission status and process algorithm change input"""
         if self.pull_client.service_is_ready():
             future = self.pull_client.call_async(WaypointPull.Request())
             future.add_done_callback(self.mission_info_callback)
-    
+        
+        self.process_algorithm_change()
 
     def save_downstream_task_to_csv(self, task_id, sub_task_id, coords, bearing, base_priority, boosted_priority, landcover_class, class_coverage_pct):
         """Save downstream task to CSV immediately when detected"""
@@ -635,28 +610,16 @@ class FireDataPlanner(Node):
         if not self.active_fire_queue or self.current_fire_index >= len(self.active_fire_queue):
             return None
         return self.active_fire_queue[self.current_fire_index]
-    def mavros_wp_list_callback(self, msg: WaypointList):
-        # Store total number of waypoints in the current mission
-        self.mavros_total_waypoints = len(msg.waypoints)
-        self.get_logger().info(f"📋 MAVROS mission updated, total waypoints: {self.mavros_total_waypoints}")
-    def mavros_wp_reached_callback(self, msg: WaypointReached):
-        self.mavros_last_reached = msg.wp_seq
-        self.get_logger().info(f"✅ MAVROS waypoint reached: {self.mavros_last_reached}")
-
-        # If mission is complete (last wp reached)
-        if self.mavros_total_waypoints > 0 and self.mavros_last_reached == self.mavros_total_waypoints - 1:
-            self.get_logger().info(f" MAVROS mission complete for {self.active_fire}")
-            self.advance_to_next_fire()
 
     def advance_to_next_fire(self):
         """Move to the next fire in the queue"""
         self.current_fire_index += 1
         if self.current_fire_index < len(self.active_fire_queue):
             next_fire = self.active_fire_queue[self.current_fire_index]
-            self.get_logger().info(f" Advanced to next fire: {next_fire}")
+            self.publish_log(f"Advanced to next fire: {next_fire}")
             return next_fire
         else:
-            self.get_logger().info("All fires completed!")
+            self.publish_log("All fires completed!")
             return None
 
     def fire_tasks_callback(self, msg: String):
@@ -673,7 +636,6 @@ class FireDataPlanner(Node):
                     self.get_logger().warning(f"Invalid location format: {location}")
                     return
 
-                # Store fire location
                 old_location = self.main_fire_locations.get(task_id)
                 if old_location and self.planner.distance_lat_lon(old_location, new_main_fire) < self.waypoint_tolerance:
                     return
@@ -681,17 +643,12 @@ class FireDataPlanner(Node):
                 self.main_fire_locations[task_id] = new_main_fire
                 self.get_logger().info(f"Updated main fire location for {task_id}: ({new_main_fire[0]:.6f}, {new_main_fire[1]:.6f})")
 
-                # Add to active queue if new
-                # Add to active queue if new
                 if task_id not in self.active_fire_queue:
                     self.active_fire_queue.append(task_id)
-                    self.sort_active_fire_queue()  # <-- sort based on precipitation
+                    self.sort_active_fire_queue()
 
-
-                # Recompute priorities for all fires
                 self.recompute_all_task_priorities()
                 
-                # Replan if this affects current fire
                 current_task = self.get_current_task_id()
                 if current_task and self.tasks_by_fire.get(current_task) and self.should_replan():
                     self.plan_and_publish_path(replan_reason="fire_location_update")
@@ -724,17 +681,13 @@ class FireDataPlanner(Node):
                     class_coverage_pct = 0.0
                     landcover_data = {'class_name': landcover_class, 'class_pct_coverage': class_coverage_pct}
                 
-                # Calculate base priority (remove previous boost)
                 base_priority = priority / priority_boost if priority < 0 else priority
                 
-                # Check downstream status
                 if self.wind_direction is not None:
                     bearing = self.planner.calculate_bearing(main_fire[0], main_fire[1], coords[0], coords[1])
                     if self.planner.is_downstream(bearing, downwind_direction):
                         new_priority = base_priority * priority_boost
-                        self.get_logger().info(f"Reprioritized downstream task {sub_task_id} in {task_id}: bearing {bearing:.1f}°, priority {base_priority:.1f} → {new_priority:.1f}")
-                        
-                        # Save ALL downstream tasks to CSV (not just reprioritized ones)
+                        #self.get_logger().info(f"Reprioritized downstream task {sub_task_id} in {task_id}: bearing {bearing:.1f}°, priority {base_priority:.1f} → {new_priority:.1f}")
                         self.save_downstream_task_to_csv(
                             task_id, sub_task_id, coords, bearing, base_priority, new_priority,
                             landcover_class, class_coverage_pct
@@ -764,10 +717,10 @@ class FireDataPlanner(Node):
             return
         
         self.wind_direction = new_wind_direction
-        self.get_logger().info(f" Received wind direction: {self.wind_direction:.1f}°")
+        self.get_logger().info(f"Received wind direction: {self.wind_direction:.1f}°")
         
-        # Recompute for ALL fires
         self.recompute_all_task_priorities()
+        self.prompt_algorithm_change()
         
         current_task = self.get_current_task_id()
         if current_task and self.tasks_by_fire.get(current_task) and self.should_replan():
@@ -778,7 +731,7 @@ class FireDataPlanner(Node):
             self.current_lat = msg.latitude
             self.current_lon = msg.longitude
             if not self.got_initial_gps:
-                self.get_logger().info(f" Initial GPS: {self.current_lat:.8f}, {self.current_lon:.8f}")
+                self.get_logger().info(f"Initial GPS: {self.current_lat:.8f}, {self.current_lon:.8f}")
                 self.got_initial_gps = True
                 
             current_task = self.get_current_task_id()
@@ -809,14 +762,13 @@ class FireDataPlanner(Node):
                 
             self.visited_waypoints.add(waypoint)
             lat, lon, alt = waypoint
-            self.get_logger().info(f" Marked fire waypoint {sub_task_id or ''} as visited: ({lat:.6f}, {lon:.6f}, {alt})")
+            self.get_logger().info(f"Marked fire waypoint {sub_task_id or ''} as visited: ({lat:.6f}, {lon:.6f}, {alt})")
             
             self.remove_visited_tasks()
             
-            # Check if current fire is completed
             current_task = self.get_current_task_id()
             if current_task and not self.tasks_by_fire.get(current_task):
-                self.get_logger().info(f" All tasks for {current_task} completed!")
+                self.get_logger().info(f"All tasks for {current_task} completed!")
                 next_fire = self.advance_to_next_fire()
                 if next_fire and self.should_replan():
                     self.path_published = False
@@ -834,7 +786,7 @@ class FireDataPlanner(Node):
             ]
             removed_count = initial_counts[task_id] - len(self.tasks_by_fire[task_id])
             if removed_count > 0:
-                self.get_logger().info(f" Removed {removed_count} visited tasks for {task_id}. Remaining: {len(self.tasks_by_fire[task_id])}")
+                self.get_logger().info(f"Removed {removed_count} visited tasks for {task_id}. Remaining: {len(self.tasks_by_fire[task_id])}")
             if not self.tasks_by_fire[task_id]:
                 del self.tasks_by_fire[task_id]
 
@@ -848,7 +800,6 @@ class FireDataPlanner(Node):
             if lat is None or lon is None:
                 return
 
-            # Initialize task list for this task_id if not exists
             if task_id not in self.tasks_by_fire:
                 self.tasks_by_fire[task_id] = []
                 
@@ -874,12 +825,10 @@ class FireDataPlanner(Node):
                     'class_pct_coverage': pct_coverage
                 }
                 
-                # FIXED: Check downstream and save to CSV immediately
                 if main_fire and self.wind_direction is not None:
                     bearing = self.planner.calculate_bearing(main_fire[0], main_fire[1], coords[0], coords[1])
                     if self.planner.is_downstream(bearing, downwind_direction):
                         priority = base_priority * priority_boost
-                        # Save to CSV immediately when detected
                         self.save_downstream_task_to_csv(
                             task_id, sub_task_id, coords, bearing, base_priority, priority,
                             pt['class_name'], pct_coverage
@@ -893,7 +842,10 @@ class FireDataPlanner(Node):
             if new_tasks:
                 self.tasks_by_fire[task_id].extend(new_tasks)
                 self.tasks_by_fire[task_id].sort(key=lambda x: x[0])
-                self.get_logger().info(f" Added {len(new_tasks)} new tasks for {task_id}, total: {len(self.tasks_by_fire[task_id])}")
+                self.get_logger().info(f"Added {len(new_tasks)} new tasks for {task_id}, total: {len(self.tasks_by_fire[task_id])}")
+                
+                if self.wind_direction is not None:
+                    self.prompt_algorithm_change()
                 
                 current_task = self.get_current_task_id()
                 if task_id == current_task and self.should_replan():
@@ -925,17 +877,18 @@ class FireDataPlanner(Node):
         json_data = json.dumps(gps_waypoints)
         self.path_pub.publish(String(data=json_data))
         self.get_logger().info(f"GPS waypoints published to /fire_planner_path_{self.drone_id}")
-        for i, wp in enumerate(gps_waypoints[:5]):  # first 5
+        for i, wp in enumerate(gps_waypoints[:5]):
             self.get_logger().info(f"  WP {i}: lat={wp[0]}, lon={wp[1]}, alt={wp[2]}")
         if len(gps_waypoints) > 10:
             self.get_logger().info("  ...")
-            for i, wp in enumerate(gps_waypoints[-5:], start=len(gps_waypoints)-5):  # last 5
+            for i, wp in enumerate(gps_waypoints[-5:], start=len(gps_waypoints)-5):
                 self.get_logger().info(f"  WP {i}: lat={wp[0]}, lon={wp[1]}, alt={wp[2]}")
+
     def sort_active_fire_queue(self):
-        """Sort active fire tasks based on precipitation (lower precip → higher priority)"""
-        # Default precip to 0 if missing
+        """Sort active fire tasks based on precipitation"""
         self.active_fire_queue.sort(key=lambda task_id: self.precip_by_fire.get(task_id, 0.0))
-        self.get_logger().info(f" Sorted active fire queue by precipitation: {self.active_fire_queue}")
+        self.publish_log(f"Sorted active fire queue by precipitation: {self.active_fire_queue}")
+
     def fire_precip_callback(self, msg: String):
         try:
             data = json.loads(msg.data)
@@ -943,10 +896,11 @@ class FireDataPlanner(Node):
             precip_mm = data.get('precip_24h_mm', 0.0)
             if task_id:
                 self.precip_by_fire[task_id] = precip_mm
-                self.get_logger().info(f" Updated 24h precip for {task_id}: {precip_mm:.2f} mm")
-                self.sort_active_fire_queue()  # Re-sort active queue whenever precipitation changes
+                self.get_logger().info(f"Updated 24h precip for {task_id}: {precip_mm:.2f} mm")
+                self.sort_active_fire_queue()
         except Exception as e:
             self.get_logger().error(f"❌ Error processing precipitation data: {e}")
+
     def mission_info_callback(self, future):
         try:
             result = future.result()
@@ -962,21 +916,21 @@ class FireDataPlanner(Node):
         
         wp_seq = msg.wp_seq
         progress = self.create_progress_bar(wp_seq, self.total_wp - 1)
-        self.get_logger().info(f"Mission Progress: {progress}")
-        #self.get_logger().info(f"✅ Reached waypoint {wp_seq}/{self.total_wp - 1}")
+        self.publish_log(f"[MISSION] Mission Progress: {progress}")
         
         if wp_seq < len(self.last_published_path):
             lat, lon, alt = self.last_published_path[wp_seq]
             self.visited_waypoints.add((lat, lon, alt))
         else:
-            self.get_logger().warning(f" Reached waypoint {wp_seq} is out of bounds of last_published_path")
+            self.get_logger().warning(f"Reached waypoint {wp_seq} is out of bounds of last_published_path")
 
         if wp_seq >= self.total_wp - 1:
-            self.get_logger().info(f" Mission complete for fire {self.get_current_task_id()}")
+            self.publish_log(f"[MISSION] Mission complete for fire {self.get_current_task_id()}")
             next_fire = self.advance_to_next_fire()
             if next_fire and self.should_replan():
                 self.path_published = False
                 self.plan_and_publish_path(replan_reason="next_fire_started")
+
     def save_simple_task_to_csv(self, coords, priority):
         """Save just coordinates and priority to CSV"""
         try:
@@ -994,7 +948,6 @@ def main(args=None):
     
     drone_id = sys.argv[1]
     
-    # Let user select algorithm
     algorithm = select_algorithm()
     print(f"\nStarting planner with {algorithm.upper().replace('_', ' ')} algorithm...\n")
     
@@ -1009,4 +962,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-

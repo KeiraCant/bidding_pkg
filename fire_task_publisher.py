@@ -17,7 +17,7 @@ class FireTaskPublisher(Node):
         
         # Predefined fires with lat, lon only
         self.predefined_fires = [
-            #{'location': [63.4215217, 10.3997097]},
+            {'location': [63.4215217, 10.3997097]},
             {'location': [63.4195320, 10.4019966]},
             #{'location': [63.4174508, 10.4037534]},
             #{'location': [63.4144163, 10.4015530]},
@@ -33,7 +33,13 @@ class FireTaskPublisher(Node):
         self.fire_timer = self.create_timer(30.0, self.publish_fire_task)
         
         self.get_logger().info("🔥 Fire Task Publisher started")
-
+    def publish_log(self, text):
+        """Publish log message to UI and console"""
+        msg = String()
+        msg.data = text
+        self.log_pub.publish(msg)
+        self.get_logger().info(text)
+        
     def publish_fire_task(self):
         if self.fire_index >= len(self.predefined_fires):
             self.get_logger().info("✅ All predefined fires published")

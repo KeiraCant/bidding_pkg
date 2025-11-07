@@ -22,6 +22,7 @@ class WindDataNode(Node):
 
         # Publisher for wind direction (in degrees)
         self.wind_direction_pub = self.create_publisher(Float32, '/wind_direction', qos)
+        self.log_pub = self.create_publisher(String, '/fire_planner_log', qos)
 
         # Frost API configuration
         self.frost_client_id = "274b14f2-3547-4403-935a-7fc46d15b0a4"  # Replace with your actual client ID
@@ -31,6 +32,14 @@ class WindDataNode(Node):
         self.station_cache = {}
 
         self.get_logger().info("🌪️ Wind Direction Node started with Frost API, waiting for /fire_tasks...")
+    
+    
+    def publish_log(self, text):
+        """Publish log message to UI and console"""
+        msg = String()
+        msg.data = text
+        self.log_pub.publish(msg)
+        self.get_logger().info(text)
 
     def find_nearby_stations(self, lat, lon, max_distance_km=50):
         """Find weather stations near the given coordinates"""
@@ -159,9 +168,9 @@ class WindDataNode(Node):
                         latest_wind_speed = float(value)
             
             if latest_wind_direction is not None:
-                self.get_logger().info(f"🌪️ Station {station_id}: Wind direction {latest_wind_direction}° at {latest_time}")
+                self.publish_log(f"[Wind] Station {station_id}: Wind direction {latest_wind_direction}° at {latest_time}")
                 if latest_wind_speed is not None:
-                    self.get_logger().info(f"💨 Wind speed: {latest_wind_speed} m/s")
+                    self.publish_log(f"[Wind] Wind speed: {latest_wind_speed} m/s")
                 return latest_wind_direction
             
             return None
@@ -183,7 +192,7 @@ class WindDataNode(Node):
             for station in stations:
                 wind_direction = self.get_wind_data_from_station(station['id'])
                 if wind_direction is not None:
-                    self.get_logger().info(f"✅ Got wind data from {station['name']} ({station['distance']:.1f}km away)")
+                    self.publish_log(f"[Wind] Got wind data from {station['name']} ({station['distance']:.1f}km away)")
                     return wind_direction
                 else:
                     self.get_logger().info(f"⚠️ No recent wind data from {station['name']}")

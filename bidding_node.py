@@ -5,7 +5,7 @@ import json
 import math
 from sensor_msgs.msg import NavSatFix
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-
+import sys
 class BiddingNode(Node):
     """Node that calculates bid scores for fire tasks based on drone GPS position."""
     def __init__(self, drone_id):
@@ -126,12 +126,21 @@ class BiddingNode(Node):
         except Exception as e:
             self.get_logger().error(f"❗ Error processing task_done: {e}")
 
+
+
 def main(args=None):
     rclpy.init(args=args)
-    node = BiddingNode('drone_1')  # change drone_id for each drone
+
+    if len(sys.argv) < 2:
+        print("Usage: bidding_node <drone_id>")
+        return
+
+    drone_id = sys.argv[1]
+    node = BiddingNode(drone_id)
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

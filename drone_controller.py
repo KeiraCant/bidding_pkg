@@ -57,6 +57,7 @@ class DroneController(Node):
         self.create_subscription(String, '/assignments', self.assignment_callback, qos)
         self.create_subscription(String, '/task_done', self.task_done_callback, qos)
         self.create_subscription(String, f'/fire_planner_path_{drone_id}', self.planned_path_callback, qos)
+        self.log_pub = self.create_publisher(String, '/fire_planner_log', qos)
 
         # Timer to check task completion and handle pending missions
         self.timer = self.create_timer(1.0, self.check_task_status)
@@ -71,6 +72,16 @@ class DroneController(Node):
             self.get_logger().info(f" Will upload waypoints and AUTO-ARM/TAKEOFF")
         else:
             self.get_logger().info(f" Will upload waypoints ONLY (pilot controls arm/takeoff/mode)")
+
+    def publish_log(self, text):
+        """Publish log message to UI and console, tagged with drone ID"""
+        tagged_text = f"[{self.drone_id}] {text}"
+        msg = String()
+        msg.data = tagged_text
+        self.log_pub.publish(msg)
+        self.get_logger().info(tagged_text)
+
+
 
     def init_service_clients(self):
         """Initialize all service clients"""
@@ -95,13 +106,13 @@ class DroneController(Node):
         if data['drone_id'] != self.drone_id:
             return
 
-        self.get_logger().info(f" Assignment received: {data}")
+        self.publish_log(f"[Controller] Assignment received: {data}")
         self.assignment = data
         self.task_simulation_start = None
 
         # If we already have a pending mission, upload it now
         if self.has_pending_mission and self.fire_planner_path:
-            self.get_logger().info(f" Assignment received, uploading pending mission with {len(self.fire_planner_path)} waypoints")
+            self.publish_log(f"[Controller] Assignment received, uploading pending mission with {len(self.fire_planner_path)} waypoints")
             self.upload_fire_planner_path_async()
             self.has_pending_mission = False
 
@@ -111,7 +122,7 @@ class DroneController(Node):
             self.arm_drone()
             self.set_takeoff()
         else:
-            self.get_logger().info(f" PILOT MODE: Waypoints uploaded. Pilot must manually arm/takeoff/set mode")
+            self.publish_log(f"[Controller] PILOT MODE: Waypoints uploaded. Pilot must manually arm/takeoff/set mode")
 
     def task_done_callback(self, msg):
         try:
@@ -122,7 +133,7 @@ class DroneController(Node):
                 self.get_logger().info(f" Task {data['task_id']} complete")
                 # DON'T clear assignment immediately - let the planner send new path first
         except Exception as e:
-            self.get_logger().error(f"Error in task_done_callback: {e}")
+            self.publish_log(f"[Controller] Error in task_done_callback: {e}")
 
     def planned_path_callback(self, msg: String):
         """Receive fire planner path and upload it as a mission"""
@@ -137,7 +148,7 @@ class DroneController(Node):
             ]
 
             if self.fire_planner_path:
-                self.get_logger().info(f"Received FIRE PLANNER path with {len(self.fire_planner_path)} GPS waypoints")
+                self.publish_log(f"[Controller] Received FIRE PLANNER path with {len(self.fire_planner_path)} GPS waypoints")
                 
                 # Always try to upload immediately, regardless of assignment status
                 self.upload_fire_planner_path_async()
@@ -145,10 +156,10 @@ class DroneController(Node):
                 try:
                     self.save_mission_waypoints()
                 except Exception as e:
-                    self.get_logger().error(f"❌ Save mission file failed: {e}")
+                    self.publish_log(f"[Controller] Save mission file failed: {e}")
 
         except Exception as e:
-            self.get_logger().error(f"❌ Error parsing fire planner path JSON: {e}")
+            self.publish_log(f"[Controller] Error parsing fire planner path JSON: {e}")
 
     def save_mission_waypoints(self, filename=None):
         """Save mission in Mission Planner .waypoints format (QGC WPL 110)"""
@@ -179,35 +190,35 @@ class DroneController(Node):
             self.get_logger().info(f" Saved Mission Planner waypoints → {filename}")
 
         except Exception as e:
-            self.get_logger().error(f"❌ Failed to save mission file: {e}")
+            self.publish_log(f"[Controller]❌ Failed to save mission file: {e}")
 
     def upload_fire_planner_path_async(self):
         """Upload fire planner path asynchronously without blocking"""
         if not self.fire_planner_path:
-            self.get_logger().warn("⚠️ No path to upload")
+            self.publish_log(f"[Controller]⚠️ No path to upload")
             return
 
         # Check if clients are ready
         if not self.wp_clear_client or not self.wp_push_client:
-            self.get_logger().error("❌ Service clients not initialized")
+            self.publish_log(f"[Controller]❌ Service clients not initialized")
             self.has_pending_mission = True
             return
 
         # Wait for services with shorter timeout
-        self.get_logger().info(" Checking service availability...")
+        self.publish_log(f"[Controller] Checking service availability...")
         
         if not self.wp_clear_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn("⚠️ WaypointClear service not ready, marking as pending")
+            self.publish_log(f"[Controller]⚠️ WaypointClear service not ready, marking as pending")
             self.has_pending_mission = True
             return
 
         if not self.wp_push_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn("⚠️ WaypointPush service not ready, marking as pending")
+            self.publish_log(f"[Controller]⚠️ WaypointPush service not ready, marking as pending")
             self.has_pending_mission = True
             return
 
         # Clear old mission first
-        self.get_logger().info(" Clearing old mission...")
+        self.publish_log(f"[Controller] Clearing old mission...")
         req_clear = WaypointClear.Request()
         future_clear = self.wp_clear_client.call_async(req_clear)
         future_clear.add_done_callback(self.on_clear_complete)
@@ -217,15 +228,15 @@ class DroneController(Node):
         try:
             result = future.result()
             if result and result.success:
-                self.get_logger().info("✅ Mission cleared successfully")
+                self.publish_log(f"[Controller]✅ Mission cleared successfully")
                 # Now upload the new mission
                 self.upload_waypoints()
             else:
-                self.get_logger().warn("⚠️ Mission clear failed, but continuing with upload...")
+                self.publish_log(f"[Controller]⚠️ Mission clear failed, but continuing with upload...")
                 # Try to upload anyway
                 self.upload_waypoints()
         except Exception as e:
-            self.get_logger().error(f"❌ Error in clear callback: {e}")
+            self.publish_log(f"[Controller]❌ Error in clear callback: {e}")
             # Try to upload anyway
             self.upload_waypoints()
 
@@ -257,12 +268,12 @@ class DroneController(Node):
             waypoints.append(wp)
 
         if not waypoints:
-            self.get_logger().error("❌ No valid waypoints to upload")
+            self.publish_log(f"[Controller]❌ No valid waypoints to upload")
             return
 
         # Push mission
         try:
-            self.get_logger().info(f" Uploading {len(waypoints)} waypoints to autopilot...")
+            self.publish_log(f"[Controller] Uploading {len(waypoints)} waypoints to autopilot...")
             req = WaypointPush.Request()
             req.start_index = 0
             req.waypoints = waypoints
@@ -278,7 +289,7 @@ class DroneController(Node):
             future.add_done_callback(self.on_waypoints_uploaded)
 
         except Exception as e:
-            self.get_logger().error(f"❌ Mission push failed: {e}")
+            self.publish_log(f"[Controller]❌ Mission push failed: {e}")
 
     def on_waypoints_uploaded(self, future):
         """Callback when waypoints are uploaded"""
@@ -286,22 +297,37 @@ class DroneController(Node):
             result = future.result()
             if result and getattr(result, "success", False):
                 count = getattr(result, "wp_transfered", len(self.fire_planner_path))
-                self.get_logger().info(f"Mission uploaded successfully! {count} waypoints transferred")
-                
+                self.get_logger().info(f" Mission uploaded successfully! {count} waypoints transferred")
+
+                # Publish log for UI
+                self.publish_log(f"[Controller]  Mission uploaded successfully ({count} waypoints)")
+
+                # If in pilot mode, just notify
                 if self.mode == 'pilot':
-                    self.get_logger().info(f" PILOT MODE: Mission ready. Pilot can now arm and takeoff")
-                    
+                    self.get_logger().info(" PILOT MODE: Mission ready. Pilot can now arm and takeoff")
+                    self.publish_log(f"[Controller]  Pilot mode: mission ready for manual start")
+
+                # If in autonomous mode, immediately request AUTO mode
+                elif self.mode == 'autonomous':
+                    self.get_logger().info(" Autonomous mode detected — switching to AUTO.MISSION")
+                    self.publish_log(f"[Controller] Requesting AUTO.MISSION mode...")
+                    self.set_auto_mode()
+
             else:
                 error_msg = getattr(result, 'error_msg', 'Unknown error') if result else 'No result'
-                self.get_logger().error(f"❌ Mission upload failed: {error_msg}")
+                self.publish_log(f"[Controller] ❌ Mission upload failed: {error_msg}")
+                self.get_logger().warn(f"Mission upload failed: {error_msg}")
+
         except Exception as e:
-            self.get_logger().error(f"❌ Error in upload callback: {e}")
+            self.publish_log(f"[Controller] ❌ Error in upload callback: {e}")
+            self.get_logger().error(f"Error in upload callback: {e}")
+
 
     def check_task_status(self):
         """Simulate task completion and handle pending missions"""
         # Handle pending mission uploads
         if self.has_pending_mission and self.fire_planner_path:
-            self.get_logger().info(f"Retrying pending mission upload...")
+            self.publish_log(f"[Controller]Retrying pending mission upload...")
             self.upload_fire_planner_path_async()
             self.has_pending_mission = False
 
@@ -353,7 +379,7 @@ class DroneController(Node):
         request = SetMode.Request()
         request.custom_mode = "AUTO"
         future = self.set_mode_client.call_async(request)
-        self.get_logger().info(" Requested AUTO.MISSION mode")
+        self.publish_log(f"[Controller] Requested AUTO.MISSION mode")
 
     def arm_drone(self):
         if self.mode != 'autonomous':
@@ -364,14 +390,14 @@ class DroneController(Node):
             return
             
         if not self.arming_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn(" Arming service not available")
+            self.publish_log(f"[Controller] Arming service not available")
             return
             
         request = CommandBool.Request()
         request.value = True
         future = self.arming_client.call_async(request)
         self.armed = True
-        self.get_logger().info("Requested drone arming")
+        self.publish_log(f"[Controller] Requested drone arming")
 
     def set_takeoff(self):
         if self.mode != 'autonomous':

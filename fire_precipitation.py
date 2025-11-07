@@ -18,14 +18,21 @@ class FirePrecipNode(Node):
         
         # Publisher for fire precipitation data
         self.fire_precip_pub = self.create_publisher(String, '/fire_precip', qos)
-        
+        self.log_pub = self.create_publisher(String, '/fire_planner_log', qos)
+
         # FROST API endpoints
         self.frost_sources_endpoint = 'https://frost.met.no/sources/v0.jsonld'
         self.frost_obs_endpoint = 'https://frost.met.no/observations/v0.jsonld'
         self.client_id = '274b14f2-3547-4403-935a-7fc46d15b0a4'  # Replace with your actual Frost API key
 
         self.get_logger().info("🌧️ Fire Precip Node started with FROST API, waiting for /fire_tasks...")
-
+    def publish_log(self, text):
+        """Publish log message to UI and console"""
+        msg = String()
+        msg.data = text
+        self.log_pub.publish(msg)
+        self.get_logger().info(text)
+        
     def haversine_distance(self, lat1, lon1, lat2, lon2):
         R = 6371  # Earth radius in km
         lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
@@ -106,7 +113,7 @@ class FirePrecipNode(Node):
             return 0.0, "no_stations"
 
         for station in stations:
-            self.get_logger().info(f"🌦️ Querying station {station['name']} ({station['distance']:.1f} km away)")
+            self.publish_log(f"[Rain]  Querying station {station['name']} ({station['distance']:.1f} km away)")
             precip = self.query_station_precip_7days(station['id'])
             if precip > 0:
                 return precip, f"FROST_{station['id']}"
@@ -137,7 +144,7 @@ class FirePrecipNode(Node):
                 'period_days': 7
             }
             self.fire_precip_pub.publish(String(data=json.dumps(result)))
-            self.get_logger().info(f"✅ Published 7-day precip for {task_id}: {precip_mm:.2f} mm")
+            self.publish_log(f"[Rain] Published 7-day precip for {task_id}: {precip_mm:.2f} mm")
         except Exception as e:
             self.get_logger().error(f"❌ Error processing fire task: {e}")
 
