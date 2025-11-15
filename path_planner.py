@@ -290,49 +290,6 @@ class MultiWaypointPlanner:
 
         return path, task_order
 
-def select_algorithm():
-    """Display menu and get user's initial algorithm choice"""
-    print("\n" + "="*70)
-    print("  FIRE RESPONSE PATH PLANNING - ALGORITHM SELECTION")
-    print("="*70)
-    print("\nNote: You will be prompted to change the algorithm if downstream tasks are detected.")
-    print("\nAvailable path planning algorithms:\n")
-    
-    print("1. MULTI-WAYPOINT PLANNING (Default)")
-    print("   Balanced scoring approach that weighs both task priority (70%)")
-    print("   and travel distance (30%). Best general-purpose algorithm.\n")
-    
-    print("2. SECTOR-BASED PLANNING")
-    print("   Divides the area into quadrants and processes the highest priority task.")
-    print("   Good for large dispersed areas.\n")
-    
-    print("3. DYNAMIC CLUSTERING")
-    print("   Groups nearby tasks into clusters and processes by priority.")
-    print("   Efficient for dense task regions.\n")
-    
-    print("4. PRIORITY SWEEP")
-    print("   Processes tasks by priority tiers (HIGH/MEDIUM/LOW).")
-    print("   Recommended for critical downstream tasks.\n")
-    
-    print("="*70)
-    
-    while True:
-        try:
-            choice = input("\nSelect initial algorithm (1-4, or press Enter for default): ").strip()
-            
-            if choice == "" or choice == "1":
-                return "multi_waypoint"
-            elif choice == "2":
-                return "sector_based"
-            elif choice == "3":
-                return "dynamic_clustering"
-            elif choice == "4":
-                return "priority_sweep"
-            else:
-                print("Invalid choice. Please enter 1-4 or press Enter for default.")
-        except KeyboardInterrupt:
-            print("\n\nExiting...")
-            sys.exit(0)
 
 class FireDataPlanner(Node):
     def __init__(self, drone_id, algorithm='multi_waypoint'):
@@ -340,6 +297,7 @@ class FireDataPlanner(Node):
         self.drone_id = drone_id
 
         # Parameters
+        self.declare_parameter('algorithm', 'multi_waypoint')  # Add algorithm parameter
         self.declare_parameter('downstream_angle_range', 45.0)
         self.declare_parameter('priority_boost', 1.5)
         self.declare_parameter('waypoint_tolerance', 0.00003)
@@ -347,7 +305,7 @@ class FireDataPlanner(Node):
         self.declare_parameter('nearby_radius', 35.0)
         self.declare_parameter('wind_direction_threshold', 1.0)
         self.declare_parameter('replan_throttle_seconds', 120.0)
-
+        algorithm = self.get_parameter('algorithm').value
         downstream_angle_range = self.get_parameter('downstream_angle_range').value
         priority_boost = self.get_parameter('priority_boost').value
         self.waypoint_tolerance = self.get_parameter('waypoint_tolerance').value
@@ -410,8 +368,7 @@ class FireDataPlanner(Node):
         self.planner = MultiWaypointPlanner(detour_threshold, nearby_radius, downstream_angle_range, priority_boost)
         self.planner.set_algorithm(algorithm)
         self.publish_log(f"Using algorithm: {algorithm.upper().replace('_', ' ')}")
-        self.get_logger().info(f"Multi-Fire Data Planner initialized for {drone_id}")
-
+        self.get_logger().info(f"Multi-Fire Data Planner initialized for {drone_id} with {algorithm}")
         self.fire_precip_sub = self.create_subscription(String, '/fire_precip', self.fire_precip_callback, qos)
         
         # MAVROS mission tracking
@@ -877,6 +834,8 @@ class FireDataPlanner(Node):
         json_data = json.dumps(gps_waypoints)
         self.path_pub.publish(String(data=json_data))
         self.get_logger().info(f"GPS waypoints published to /fire_planner_path_{self.drone_id}")
+        summary = f"Published path with {len(gps_waypoints)} waypoints"
+        self.publish_log(summary)
         for i, wp in enumerate(gps_waypoints[:5]):
             self.get_logger().info(f"  WP {i}: lat={wp[0]}, lon={wp[1]}, alt={wp[2]}")
         if len(gps_waypoints) > 10:
@@ -948,10 +907,9 @@ def main(args=None):
     
     drone_id = sys.argv[1]
     
-    algorithm = select_algorithm()
-    print(f"\nStarting planner with {algorithm.upper().replace('_', ' ')} algorithm...\n")
+    # Create node - algorithm is set via ROS2 parameter in __init__
+    node = FireDataPlanner(drone_id)
     
-    node = FireDataPlanner(drone_id, algorithm)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
