@@ -1,3 +1,12 @@
+#retrieves real-time wind direction data from Norway's Frost meteorological API and publishes it to fire planning drones. 
+# When a fire task is received on /fire_tasks, the node extracts the fire's GPS coordinates and queries the Frost API to find nearby weather stations 
+# within 50km. It searches the stations in order of proximity, requesting wind observations from the last 24 hours using the /observations endpoint
+#  with wind_from_direction and wind_speed elements. Once valid wind data is found from the nearest available station, the node publishes the wind
+#  direction (in degrees) to the /wind_direction topic, which the fire planner uses to detect downstream fire spread zones and apply priority boosts.
+#  The node maintains a station cache to avoid repeated API lookups for the same geographic area and logs all data retrieval activities to both the 
+# console and a /fire_planner_log topic for system-wide visibility. If no stations have recent data, it iterates through alternatives before logging
+# a warning, ensuring robust operation even with sparse meteorological coverage.
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -25,24 +34,24 @@ class WindDataNode(Node):
         self.log_pub = self.create_publisher(String, '/fire_planner_log', qos)
 
         # Frost API configuration
-        self.frost_client_id = "274b14f2-3547-4403-935a-7fc46d15b0a4"  # Replace with your actual client ID
+        self.frost_client_id = "274b14f2-3547-4403-935a-7fc46d15b0a4" 
         self.frost_base_url = "https://frost.met.no"
         
         # Cache for nearby stations to avoid repeated lookups
         self.station_cache = {}
 
-        self.get_logger().info("🌪️ Wind Direction Node started with Frost API, waiting for /fire_tasks...")
+        self.get_logger().info(" Wind Direction Node started with Frost API, waiting for /fire_tasks...")
     
     
     def publish_log(self, text):
-        """Publish log message to UI and console"""
+        #Publish log message to UI and console
         msg = String()
         msg.data = text
         self.log_pub.publish(msg)
         self.get_logger().info(text)
 
     def find_nearby_stations(self, lat, lon, max_distance_km=50):
-        """Find weather stations near the given coordinates"""
+        #Find weather stations near the given coordinates
         cache_key = f"{lat:.2f},{lon:.2f}"
         if cache_key in self.station_cache:
             return self.station_cache[cache_key]
@@ -61,7 +70,7 @@ class WindDataNode(Node):
             # Check if the request worked (following official example)
             if r.status_code == 200:
                 json_data = r.json()
-                self.get_logger().info(f"✅ Data retrieved from frost.met.no!")
+                self.get_logger().info(f" Data retrieved from frost.met.no!")
             else:
                 json_data = r.json()
                 self.get_logger().error(f"❌ Error! Returned status code {r.status_code}")
@@ -102,9 +111,9 @@ class WindDataNode(Node):
             # Cache result
             self.station_cache[cache_key] = stations
             
-            self.get_logger().info(f"🗺️ Found {len(stations)} stations within {max_distance_km}km of ({lat:.4f}, {lon:.4f})")
+            self.get_logger().info(f" Found {len(stations)} stations within {max_distance_km}km of ({lat:.4f}, {lon:.4f})")
             for station in stations[:3]:  # Log first 3
-                self.get_logger().info(f"   📍 {station['name']} ({station['id']}) - {station['distance']:.1f}km")
+                self.get_logger().info(f"    {station['name']} ({station['id']}) - {station['distance']:.1f}km")
             
             return stations
             
@@ -138,7 +147,7 @@ class WindDataNode(Node):
             if r.status_code == 200:
                 json_data = r.json()
                 data = json_data.get('data', [])
-                self.get_logger().info(f"✅ Got {len(data)} observations from {station_id}")
+                self.get_logger().info(f" Got {len(data)} observations from {station_id}")
             else:
                 json_data = r.json()
                 self.get_logger().error(f"❌ Error for station {station_id}! Status code {r.status_code}")
@@ -185,7 +194,7 @@ class WindDataNode(Node):
             # Find nearby stations
             stations = self.find_nearby_stations(lat, lon)
             if not stations:
-                self.get_logger().warning(f"⚠️ No weather stations found near ({lat:.6f}, {lon:.6f})")
+                self.get_logger().warning(f" No weather stations found near ({lat:.6f}, {lon:.6f})")
                 return None
             
             # Try to get data from stations, starting with the closest
@@ -195,7 +204,7 @@ class WindDataNode(Node):
                     self.publish_log(f"[Wind] Got wind data from {station['name']} ({station['distance']:.1f}km away)")
                     return wind_direction
                 else:
-                    self.get_logger().info(f"⚠️ No recent wind data from {station['name']}")
+                    self.get_logger().info(f" No recent wind data from {station['name']}")
             
             # If no data from any station
             self.get_logger().warning(f"❌ No recent wind data available from any nearby stations")
@@ -229,7 +238,7 @@ class WindDataNode(Node):
                 self.get_logger().warning(f"❌ Invalid location format: {location}")
                 return
 
-            self.get_logger().info(f"🌪️ Processing wind direction for {task_id} at ({fire_lat:.6f}, {fire_lon:.6f})")
+            self.get_logger().info(f" Processing wind direction for {task_id} at ({fire_lat:.6f}, {fire_lon:.6f})")
 
             wind_direction = self.get_wind_direction_for_location(fire_lat, fire_lon)
             if wind_direction is not None:
@@ -237,7 +246,7 @@ class WindDataNode(Node):
                 self.wind_direction_pub.publish(Float32(data=wind_direction))
                 self.get_logger().info(f"✅ Published wind direction for {task_id}: {wind_direction:.1f}°")
             else:
-                self.get_logger().warning(f"⚠️ Could not get wind direction for {task_id}")
+                self.get_logger().warning(f" Could not get wind direction for {task_id}")
 
         except Exception as e:
             self.get_logger().error(f"❌ Error processing fire task: {e}")

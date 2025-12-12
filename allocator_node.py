@@ -1,3 +1,14 @@
+#The allocator node acts as a centralised auction controller. Each UAV publishes a bid for a task that includes its drone ID, bid score, 
+# and location. When the first bid arrives for a task, the allocator starts a 10-second timer and collects all incoming bids. 
+# If all three drones submit a bid before the timer expires, it assigns the task immediately. 
+# If the timer expires first, it assigns using whatever bids are available.
+#Only drones that are not already busy are considered eligible. If every bidder for a task is currently occupied, 
+# the task is placed into a pending queue. When a drone finishes a task and publishes a /task_done message, 
+# the allocator marks it as free and checks whether any pending task now has an eligible bidder, assigning immediately if so.
+#Assignments are published on /assignments and include the selected drone, the task location, and the fire priority value
+# (which is stored but does not affect selection). After a task is assigned, all its associated state is cleared to prevent stale data 
+# from affecting future allocations.
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -51,7 +62,7 @@ class AllocatorNode(Node):
             task_id = data['task_id']
             priority = data['priority']
             self.task_priorities[task_id] = priority
-            self.get_logger().info(f"🔥 Received priority {priority:.3f} for task {task_id}")
+            self.get_logger().info(f"Received priority {priority:.3f} for task {task_id}")
         except Exception as e:
             self.get_logger().error(f"❌ Error parsing /fire_priority: {e}")
 
@@ -67,16 +78,16 @@ class AllocatorNode(Node):
             if task_id not in self.active_tasks:
                 self.active_tasks[task_id] = []
                 self.task_timers[task_id] = time.time()
-                self.get_logger().info(f"⏰ Started 10-second bid timer for task {task_id}")
+                self.get_logger().info(f"Started 10-second bid timer for task {task_id}")
 
             self.active_tasks[task_id].append((drone_id, bid_score, location))
             self.get_logger().info(
-                f"\n📨 New bid received:\n"
-                f"  🔧 Task ID: {task_id}\n"
-                f"  🚁 Drone ID: {drone_id}\n"
-                f"  📊 Score: {bid_score:.2f}\n"
-                f"  📍 Location: {location}\n"
-                f"  📊 Total bids for this task: {len(self.active_tasks[task_id])}"
+                f"\n New bid received:\n"
+                f"   Task ID: {task_id}\n"
+                f"   Drone ID: {drone_id}\n"
+                f"   Score: {bid_score:.2f}\n"
+                f"   Location: {location}\n"
+                f"   Total bids for this task: {len(self.active_tasks[task_id])}"
             )
 
             # If 3 bids received, assign immediately
@@ -95,7 +106,7 @@ class AllocatorNode(Node):
 
         for task_id in expired_tasks:
             if task_id in self.active_tasks and len(self.active_tasks[task_id]) > 0:
-                self.get_logger().info(f"⏰ Bid timer expired for task {task_id} with {len(self.active_tasks[task_id])} bids")
+                self.get_logger().info(f" Bid timer expired for task {task_id} with {len(self.active_tasks[task_id])} bids")
                 self.try_assign_task(task_id)
             else:
                 # Clean up if no bids received
@@ -125,8 +136,8 @@ class AllocatorNode(Node):
         if task_id not in self.active_tasks:
             return
 
-        # Select the drone with lowest bid score
-        best = min(eligible_bids, key=lambda x: x[1])
+        # Select the drone with highest bid score
+        best = max(eligible_bids, key=lambda x: x[1])
         drone_id, bid_score, location = best
 
         assignment = {
@@ -137,7 +148,7 @@ class AllocatorNode(Node):
         }
 
         self.assignment_pub.publish(String(data=json.dumps(assignment)))
-        self.get_logger().info(f"✅ Assigned {task_id} to {drone_id} (bid: {bid_score:.2f}, priority: {assignment['priority']:.3f})")
+        self.get_logger().info(f" Assigned {task_id} to {drone_id} (bid: {bid_score:.2f}, priority: {assignment['priority']:.3f})")
 
         self.mark_drone_busy(drone_id)
 
@@ -155,7 +166,7 @@ class AllocatorNode(Node):
             task_id = data['task_id']
 
             self.mark_drone_free(drone_id)
-            self.get_logger().info(f"🔓 Drone {drone_id} completed task {task_id}, marked as free.")
+            self.get_logger().info(f" Drone {drone_id} completed task {task_id}, marked as free.")
 
             # Attempt pending assignments
             if self.pending_tasks:

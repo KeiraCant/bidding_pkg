@@ -1,3 +1,11 @@
+#The bidding node runs on each UAV and continuously listens for three things: its own GPS position, incoming fire tasks, and assignment
+#  or completion messages. It maintains the drone’s current GPS coordinates and only bids when it is free and has a valid fix.
+#When a fire task is received, the node computes the Haversine distance between the drone’s position and the fire’s location. 
+# This distance is normalised into a bid score where closer drones generate higher scores. 
+# The node then publishes a bid message containing the task ID, drone ID, bid score, and the fire’s location.
+#If the allocator later assigns this drone to that task, the node records the task as active and stops bidding on new ones. 
+# When the drone completes the task and publishes a /task_done message, the node resets its internal state so that it can participate in future auctions.
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -57,19 +65,19 @@ class BiddingNode(Node):
         # Publisher for bids
         self.bid_pub = self.create_publisher(String, '/bids', 10)
 
-        self.get_logger().info(f"🚁 {drone_id} bidding node started, waiting for GPS...")
+        self.get_logger().info(f" {drone_id} bidding node started, waiting for GPS...")
 
     def gps_callback(self, msg):
-        """Update current GPS position."""
+        #Update current GPS position
         self.current_gps = [msg.latitude, msg.longitude, msg.altitude]
 
         # Log initial GPS only once
         if not self.got_initial_gps:
-            self.get_logger().info(f"📡 Initial GPS: {self.current_gps}")
+            self.get_logger().info(f" Initial GPS: {self.current_gps}")
             self.got_initial_gps = True
 
     def haversine_distance(self, lat1, lon1, lat2, lon2):
-        """Calculate distance (meters) between two GPS coordinates."""
+        #Calculate distance (meters) between two GPS coordinates
         R = 6371000  # Earth radius in meters
         phi1, phi2 = math.radians(lat1), math.radians(lat2)
         delta_phi = math.radians(lat2 - lat1)
@@ -82,13 +90,14 @@ class BiddingNode(Node):
         return R * c
 
     def distance_to_bid_score(self, distance):
-        """Convert distance to bid score: closer fires = higher bid."""
+        #Convert distance to bid score: closer fires = higher bid.
         max_distance = 2000.0
         normalized = max(0.0, min(1.0, 1 - (distance / max_distance)))
         return int(normalized * 99) + 1
 
     def fire_callback(self, msg):
-        """Send bid for the closest fire task if not already assigned."""
+        #React to a newly published fire task.
+        #If the drone is idle and has a GPS fix, compute the distance and publish a bid.
         if self.current_task is not None or self.current_gps is None:
             return
 
@@ -108,7 +117,7 @@ class BiddingNode(Node):
 
         self.bid_pub.publish(String(data=json.dumps(bid)))
         # Log GPS only when submitting a bid
-        self.get_logger().info(f"📡 Submitting bid from GPS: {self.current_gps}")
+        self.get_logger().info(f" Submitting bid from GPS: {self.current_gps}")
         self.get_logger().info(f"Sent bid for task {fire['task_id']} at distance {dist:.1f} m: {bid}")
 
     def assignment_callback(self, msg):

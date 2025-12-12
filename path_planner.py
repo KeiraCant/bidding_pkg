@@ -1,3 +1,14 @@
+#Path planner node runs on each UAV and continuously listens for GPS position, fire task data, wind direction updates, and task completion messages. 
+# When fire waypoints arrive with land cover classifications, it computes multi-factor priorities based on vegetation type (
+# Built-up: 100 points, Trees: 80, Water: 0), coverage percentage, and distance. Most notably it monitors wind direction and applies a 1.5× priority boost
+#  to tasks detected downwind of active fires (within ±45° of wind bearing), marking these high-risk spread zones in CSV logs.
+#  The node maintains a queue of active fires sorted by precipitation (driest first) and uses one of four selectable path planning algorithms 
+# (multi-waypoint balancing, sector-based, dynamic clustering, or priority sweep tiers) to generate optimal flight paths. It dynamically 
+# replans when wind changes significantly, new fire data arrives, or tasks complete, throttling updates to 120-second intervals. The planner 
+# publishes paths to /fire_planner_path_{drone_id}, tracks mission progress via MAVROS waypoint completion, and automatically advances to the next 
+# fire when the current mission finishes. All execution orders, downstream detections, and priorities are logged to CSV files for post-mission analysis.
+
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Float32

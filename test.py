@@ -1,9 +1,5 @@
 
 
-"""
-Debug script to test if your path planner is properly using LiDAR obstacles
-Run this alongside your main path planner to verify integration
-"""
 
 import rclpy
 from rclpy.node import Node

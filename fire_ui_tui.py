@@ -1,3 +1,10 @@
+#FireUIDashboard node provides a graphical user interface (GUI) dashboard for monitoring a multi-drone wildfire management system. 
+# It subscribes to ROS2 topics /fire_planner_log and /fire_tasks to collect logs related to drone path planning, controller status,
+#  mission progress, and fire/environmental data. The dashboard organises this information into distinct scrollable panels—separating mission progress, 
+# controller logs, path planning logs and fire/environmental updates. It runs the ROS2 spin in a background thread while continuously 
+# updating the Tkinter-based GUI every 500 ms, offering real-time visualisation of system status and events.
+
+
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
@@ -88,7 +95,7 @@ class FireUIDashboard(Node):
         # ---------------- Mission Progress Area Setup ----------------
         tk.Label(self.mission_frame, text="Mission Progress", bg='black', fg='white', font=("Helvetica", 14, "bold")).pack(pady=5)
 
-        # Scrollable canvas/frame to hold multiple mission progress boxes
+        # Scrollable canvas to hold multiple mission progress boxes
         self.mission_canvas = tk.Canvas(self.mission_frame, bg='black', highlightthickness=0)
         self.mission_scrollbar = tk.Scrollbar(self.mission_frame, orient="vertical", command=self.mission_canvas.yview)
         self.mission_inner_frame = tk.Frame(self.mission_canvas, bg='black')
@@ -136,7 +143,7 @@ class FireUIDashboard(Node):
         # ---------------- Path Planning Log (Split by Drone) ----------------
         tk.Label(self.general_frame, text="Path Planning Log", bg='black', fg='white', font=("Helvetica", 14, "bold")).pack(pady=5)
 
-        # Scrollable canvas/frame to hold multiple planner boxes
+        # Scrollable canvas/ to hold multiple planner boxes
         self.planner_canvas = tk.Canvas(self.general_frame, bg='black', highlightthickness=0)
         self.planner_scrollbar = tk.Scrollbar(self.general_frame, orient="vertical", command=self.planner_canvas.yview)
         self.planner_inner_frame = tk.Frame(self.planner_canvas, bg='black')

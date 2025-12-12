@@ -1,3 +1,6 @@
+#FireTaskPublisher node simulates fire events by periodically publishing fire task messages containing unique IDs and geographic coordinates to the 
+# /fire_tasks topic. It iterates through a predefined list of fire locations and publishes one fire task every 30 seconds, allowing other nodes in the 
+# system to subscribe and react to new fire incidents. The node logs its publishing activity for monitoring.
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -18,7 +21,7 @@ class FireTaskPublisher(Node):
         # Predefined fires with lat, lon only
         self.predefined_fires = [
             {'location': [63.4215217, 10.3997097]},
-            {'location': [63.4195320, 10.4019966]},
+            #{'location': [63.4195320, 10.4019966]},
             #{'location': [63.4174508, 10.4037534]},
             #{'location': [63.4144163, 10.4015530]},
             #{'location': [63.4296754, 10.3975590]},
@@ -32,7 +35,7 @@ class FireTaskPublisher(Node):
         # Timer to publish fires every 30 seconds
         self.fire_timer = self.create_timer(30.0, self.publish_fire_task)
         
-        self.get_logger().info("🔥 Fire Task Publisher started")
+        self.get_logger().info(" Fire Task Publisher started")
     def publish_log(self, text):
         """Publish log message to UI and console"""
         msg = String()
@@ -67,7 +70,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("🔥 Fire Task Publisher shutting down...")
+        node.get_logger().info(" Fire Task Publisher shutting down...")
     finally:
         node.destroy_node()
         rclpy.shutdown()

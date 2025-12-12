@@ -1,3 +1,9 @@
+#DroneController node manages a UAV's mission execution by receiving planned fire response waypoints, uploading them to the autopilot, 
+# and handling autonomous or pilot-controlled operation modes. It listens for GPS updates, task assignments, and completion messages, 
+# and interacts with MAVROS services to arm the drone, set flight modes, and initiate takeoff when in autonomous mode. 
+# The controller also logs mission progress and publishes visited waypoints for monitoring.
+
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -62,7 +68,7 @@ class DroneController(Node):
         # Timer to check task completion and handle pending missions
         self.timer = self.create_timer(1.0, self.check_task_status)
 
-        # Initialize service clients
+        # Initialise service clients
         self.init_service_clients()
 
         mode_str = "AUTONOMOUS" if self.mode == 'autonomous' else "PILOT IN THE LOOP"
@@ -74,7 +80,7 @@ class DroneController(Node):
             self.get_logger().info(f" Will upload waypoints ONLY (pilot controls arm/takeoff/mode)")
 
     def publish_log(self, text):
-        """Publish log message to UI and console, tagged with drone ID"""
+        #Publish log message to UI and console, tagged with drone ID
         tagged_text = f"[{self.drone_id}] {text}"
         msg = String()
         msg.data = tagged_text
@@ -84,7 +90,7 @@ class DroneController(Node):
 
 
     def init_service_clients(self):
-        """Initialize all service clients"""
+        #Initialise all service clients
         self.wp_push_client = self.create_client(WaypointPush, f'/{self.drone_id}/mavros/mission/push')
         self.wp_clear_client = self.create_client(WaypointClear, f'/{self.drone_id}/mavros/mission/clear')
         
@@ -95,7 +101,7 @@ class DroneController(Node):
             self.takeoff_client = self.create_client(CommandTOL, f'/{self.drone_id}/mavros/cmd/takeoff')
 
     def gps_callback(self, msg: NavSatFix):
-        if msg.status.status >= 0:  # valid fix
+        if msg.status.status >= 0:  
             self.current_gps = msg
             if not self.got_initial_gps:
                 self.get_logger().info(f" Initial GPS fix: {msg.latitude:.8f}, {msg.longitude:.8f}")
@@ -136,7 +142,7 @@ class DroneController(Node):
             self.publish_log(f"[Controller] Error in task_done_callback: {e}")
 
     def planned_path_callback(self, msg: String):
-        """Receive fire planner path and upload it as a mission"""
+        #Receive fire planner path and upload it as a mission
         try:
             new_path = json.loads(msg.data)  # list of [lat, lon, alt]
 
@@ -155,6 +161,7 @@ class DroneController(Node):
                 
                 try:
                     self.save_mission_waypoints()
+                    self.save_mission_json()
                 except Exception as e:
                     self.publish_log(f"[Controller] Save mission file failed: {e}")
 
@@ -162,7 +169,7 @@ class DroneController(Node):
             self.publish_log(f"[Controller] Error parsing fire planner path JSON: {e}")
 
     def save_mission_waypoints(self, filename=None):
-        """Save mission in Mission Planner .waypoints format (QGC WPL 110)"""
+        #Save mission in Mission Planner .waypoints format (QGC WPL 110)
         if not self.fire_planner_path:
             self.get_logger().warn("⚠️ No path to save to Mission Planner file")
             return
@@ -191,6 +198,102 @@ class DroneController(Node):
 
         except Exception as e:
             self.publish_log(f"[Controller]❌ Failed to save mission file: {e}")
+  
+
+    def save_mission_json(self, filename=None):
+        #Save mission waypoints in JSON format matching your example.
+
+        if not self.fire_planner_path:
+            self.get_logger().warn("⚠️ No path to save mission JSON")
+            return
+
+        if filename is None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{self.drone_id}_{ts}.json"
+
+        mission_items = []
+        for i, (lat, lon, alt) in enumerate(self.fire_planner_path):
+            # For first item, command 22 (takeoff), else 16 (waypoint)
+            command = 22 if i == 0 else 16
+            
+            # Params array follows your example:
+            # [param1=altitude, param2=0, param3=0, param4=0 or null, lat, lon, alt]
+            
+            param4 = 0 if command == 22 else 0 
+            
+            params = [
+                float(alt) if command == 22 else 0,
+                0,
+                0,
+                param4,
+                float(lat),
+                float(lon),
+                float(alt)
+            ]
+
+            item = {
+                "AMSLAltAboveTerrain": alt,
+                "Altitude": alt,
+                "AltitudeMode": 1,
+                "autoContinue": True,
+                "command": command,
+                "doJumpId": i + 1,
+                "frame": 3,
+                "params": params,
+                "type": "SimpleItem"
+            }
+            mission_items.append(item)
+
+        
+        last_lat, last_lon, _ = self.fire_planner_path[-1]
+        land_item = {
+            "AMSLAltAboveTerrain": 0,
+            "Altitude": 0,
+            "AltitudeMode": 1,
+            "autoContinue": True,
+            "command": 21,  # MAV_CMD_LAND
+            "doJumpId": len(mission_items) + 1,
+            "frame": 3,
+            "params": [0, 0, 0, 0, last_lat, last_lon, 0],
+            "type": "SimpleItem"
+        }
+        mission_items.append(land_item)
+
+        mission_json = {
+            "fileType": "Plan",
+            "geoFence": {
+                "circles": [],
+                "polygons": [],
+                "version": 2
+            },
+            "groundStation": "QGroundControl",
+            "mission": {
+                "cruiseSpeed": 15,
+                "firmwareType": 0,
+                "hoverSpeed": 5,
+                "items": mission_items,
+                "plannedHomePosition": [
+                    self.fire_planner_path[0][0],  # home lat
+                    self.fire_planner_path[0][1],  # home lon
+                    188  
+                ],
+                "vehicleType": 2,
+                "version": 2
+            },
+            "rallyPoints": {
+                "points": [],
+                "version": 2
+            },
+            "version": 1
+        }
+
+        try:
+            with open(filename, 'w') as f:
+                json.dump(mission_json, f, indent=4)
+            self.get_logger().info(f"Saved mission JSON → {filename}")
+        except Exception as e:
+            self.publish_log(f"[Controller]❌ Failed to save mission JSON: {e}")
+
 
     def upload_fire_planner_path_async(self):
         """Upload fire planner path asynchronously without blocking"""

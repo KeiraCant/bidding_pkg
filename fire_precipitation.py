@@ -1,3 +1,8 @@
+#FirePrecipNode is a ROS 2 node designed to monitor fire tasks by querying precipitation data from nearby weather stations using the 
+# Norwegian Meteorological Institute's FROST API. Upon receiving a fire task with location data, it identifies nearby sensor stations within a set radius,
+# retrieves the accumulated precipitation over the past 7 days, and publishes this information for use in fire risk assessment or planning. 
+# The node logs its operations and handles network or data errors gracefully to maintain robust operation.
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -23,24 +28,26 @@ class FirePrecipNode(Node):
         # FROST API endpoints
         self.frost_sources_endpoint = 'https://frost.met.no/sources/v0.jsonld'
         self.frost_obs_endpoint = 'https://frost.met.no/observations/v0.jsonld'
-        self.client_id = '274b14f2-3547-4403-935a-7fc46d15b0a4'  # Replace with your actual Frost API key
+        self.client_id = '274b14f2-3547-4403-935a-7fc46d15b0a4'  
 
         self.get_logger().info("🌧️ Fire Precip Node started with FROST API, waiting for /fire_tasks...")
     def publish_log(self, text):
-        """Publish log message to UI and console"""
+        #Publish log message to UI and console
         msg = String()
         msg.data = text
         self.log_pub.publish(msg)
         self.get_logger().info(text)
         
     def haversine_distance(self, lat1, lon1, lat2, lon2):
+        #Calculate the great-circle distance between two GPS coordinates using the haversine formula.
+        
         R = 6371  # Earth radius in km
         lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
         dlat = lat2 - lat1
         dlon = lon2 - lon1
         a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
         return 2 * R * math.asin(math.sqrt(a))
-
+    #Query FROST API for sensor stations and find up to 5 nearest stations within max_distance_km. Returns a list of station info dicts sorted by distance.
     def find_nearest_stations(self, fire_lat, fire_lon, max_distance_km=50):
         try:
             response = requests.get(self.frost_sources_endpoint, params={"types": "SensorSystem"}, auth=(self.client_id, ''))
@@ -60,12 +67,12 @@ class FirePrecipNode(Node):
                             'distance': distance
                         })
             stations.sort(key=lambda x: x['distance'])
-            self.get_logger().info(f"🔍 Found {len(stations)} stations within {max_distance_km} km")
+            self.get_logger().info(f" Found {len(stations)} stations within {max_distance_km} km")
             return stations[:5]
         except Exception as e:
             self.get_logger().error(f"❌ Error finding stations: {e}")
             return []
-
+    #Query precipitation amount for one day at a given station from FROST API. Returns total precipitation in mm or 0 if data unavailable.
     def query_station_precip_1day(self, station_id, date):
         """Query sum(precipitation_amount P1D) for a single day directly from /observations"""
         date_str = date.strftime('%Y-%m-%d')
@@ -94,7 +101,7 @@ class FirePrecipNode(Node):
         except Exception as e:
             self.get_logger().error(f"❌ Error querying precipitation for {station_id}: {e}")
             return 0.0
-
+    #Query precipitation summed over the past 7 days for a station. Aggregates daily precipitation values.
     def query_station_precip_7days(self, station_id):
         """Query sum(precipitation_amount P1D) for the last 7 days for a station"""
         total_precip = 0.0
@@ -105,7 +112,8 @@ class FirePrecipNode(Node):
             total_precip += self.query_station_precip_1day(station_id, date)
         
         return total_precip
-
+    
+    # For a given fire location, find nearby stations and query their 7-day precipitation. Returns the first non-zero precipitation found or zero with appropriate status.
     def query_precip_7_days(self, fire_lat, fire_lon):
         """Main 7-day precipitation query"""
         stations = self.find_nearest_stations(fire_lat, fire_lon, max_distance_km=100)
@@ -119,7 +127,7 @@ class FirePrecipNode(Node):
                 return precip, f"FROST_{station['id']}"
 
         return 0.0, "no_data"
-
+    #Callback triggered when a new fire task message is received. Extracts fire location and publishes 7-day precipitation info for that location.
     def fire_task_callback(self, msg):
         try:
             fire_task = json.loads(msg.data)
@@ -131,7 +139,7 @@ class FirePrecipNode(Node):
                 self.get_logger().warning(f"❌ Invalid location format: {location}")
                 return
 
-            self.get_logger().info(f"🌍 Checking 7-day precip for {task_id} at ({fire_lat:.6f}, {fire_lon:.6f})")
+            self.get_logger().info(f" Checking 7-day precip for {task_id} at ({fire_lat:.6f}, {fire_lon:.6f})")
             precip_mm, data_source = self.query_precip_7_days(fire_lat, fire_lon)
 
             result = {
