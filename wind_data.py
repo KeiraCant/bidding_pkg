@@ -34,7 +34,7 @@ class WindDataNode(Node):
         self.log_pub = self.create_publisher(String, '/fire_planner_log', qos)
 
         # Frost API configuration
-        self.frost_client_id = "274b14f2-3547-4403-935a-7fc46d15b0a4" 
+        self.frost_client_id = "createyourownaccounttogetAPIkey" 
         self.frost_base_url = "https://frost.met.no"
         
         # Cache for nearby stations to avoid repeated lookups
